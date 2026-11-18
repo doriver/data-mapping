@@ -11,8 +11,8 @@ import pandas as pd
 if sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-RAW_DIR = r"D:\dev\data\raw"
-BASIS_DIR = r"D:\dev\data\basis"
+RAW_DIR = r"D:\dev\data\raw\traded_land_raw\25"
+BASIS_DIR = r"D:\dev\data\basis\land_characteristics\26"
 # 파일명이 이 이름들 중 하나로 시작하면 해당 지역으로 판별한다.
 # (예: "서울25년_토지(매매)_실거래가.xlsx", "서울토지특성정보_20260519.csv" -> "서울")
 # 실제 파일명 규칙이 다르면 이 목록만 조정하면 된다.
@@ -20,11 +20,16 @@ REGION_NAMES = [
     "서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종",
     "경기", "강원", "충청북", "충북", "충청남", "충남", "전북", "전라남", "전남", "경상북", "경북", "경상남", "경남", "제주",
 ]
+# 법정동 변경 이력. 실거래는 최신 법정동명, 토지특성정보는 해당 연도 시점 법정동명을 쓰므로
+# csv에 실거래 법정동이 없으면 이 이력을 거꾸로 따라가 과거 법정동명으로 다시 조회한다.
+BJD_CHANGE_DIR = r"D:\dev\data\basis\bjd_change"
+BJD_CHANGE_PATTERN = "tbl_bjd_code_mapping_history_*.csv"
+BJD_CHANGE_ENCODING = "utf-8-sig"
 CSV_ENCODING = "cp949"
 CSV_CHUNK_SIZE = 200_000
 CSV_USECOLS = ["고유번호", "법정동명", "지번", "지목명", "용도지역명1", "토지면적", "대장구분명", "공시지가", "도로접면코드"]
 HEADER_ROW = 12  # 실제 표 헤더가 있는 엑셀 행(0-index)
-OUTPUT_DIR = r"D:\dev\data\processed"
+OUTPUT_DIR = r"D:\dev\data\processed\traded_land_processed\25"
 DATA_START_ROW = 5  # 0-index. 상단 4행(전체/제외/처리대상/성공 건수) + 빈 줄을 남기고 그 아래부터 표 작성
 AREA_TOLERANCE = 0.01
 EMPTY_VALUE = "-"  # 실제 거래된거를 나타내는 값( 해제된경우는 날짜 들어가있음 )
@@ -56,6 +61,50 @@ def _match_region(filename: str):
         if filename.startswith(region):
             return region
     return None
+
+"""법정동 변경 이력 csv를 읽어 {최신 법정동명: {과거 법정동명, ...}} 역방향 dict를 만든다.
+
+    이름은 "시도 시군구 읍면동 [리]"를 공백으로 이은 전체 이름이다(실거래 시군구, csv 법정동명과 같은 형식).
+    (예: "경기도 화성시 만세구 새솔동" -> {"경기도 화성시 새솔동"})
+    읍면동이 없는 시도/시군구 단위 행은 실거래 시군구와 비교할 수 없으므로 제외한다.
+    합병처럼 새 이름 하나에 과거 이름이 여럿일 수 있으므로 값은 집합이다.
+"""
+def _load_bjd_reverse_map() -> dict:
+    paths = sorted(glob.glob(os.path.join(BJD_CHANGE_DIR, BJD_CHANGE_PATTERN)))
+    if not paths:
+        print(f"경고: 법정동 변경 이력 파일이 없어 과거 법정동 회귀 조회를 하지 않음 ({BJD_CHANGE_DIR})")
+        return {}
+    path = paths[-1]  # 파일명 끝의 생성시각 기준 최신 파일
+    history = pd.read_csv(path, encoding=BJD_CHANGE_ENCODING, dtype=str)
+    history = history[history["prev_emd_nm"].notna() & history["next_emd_nm"].notna()]
+
+    def full_name(row, side):
+        parts = [row[f"{side}_{level}_nm"] for level in ("sido", "sgg", "emd", "ri")]
+        return " ".join(p.strip() for p in parts if isinstance(p, str) and p.strip())
+
+    reverse_map = {}
+    for _, row in history.iterrows():
+        prev_name, next_name = full_name(row, "prev"), full_name(row, "next")
+        if prev_name != next_name:
+            reverse_map.setdefault(next_name, set()).add(prev_name)
+    print(f"법정동 변경 이력 로드: {os.path.basename(path)} (읍면동 단위 {len(reverse_map)}건)")
+    return reverse_map
+
+"""변경 이력을 거꾸로 따라가(BFS) dong의 과거 법정동명들을 가까운 시점부터 순서대로 반환한다. (dong 자신은 제외)"""
+def _ancestors(dong: str, reverse_map: dict) -> list:
+    result = []
+    visited = {dong}
+    frontier = [dong]
+    while frontier:
+        next_frontier = []
+        for name in frontier:
+            for prev_name in sorted(reverse_map.get(name, ())):
+                if prev_name not in visited:
+                    visited.add(prev_name)
+                    result.append(prev_name)
+                    next_frontier.append(prev_name)
+        frontier = next_frontier
+    return result
 
 """RAW_DIR의 xlsx와 BASIS_DIR의 csv를 파일명 접두어(지역명) 기준으로 짝짓는다.
 
@@ -134,8 +183,11 @@ def _load_deals(xlsx_path: str):
     _match_and_write에서 row마다 반복되는 등호 조건(법정동명/산여부)을
     미리 groupby로 나눠둠으로써, row 순회 시에는 훨씬 작아진 후보군에서
     번지(본번 자리수/접두어)와 면적만 비교하면 되도록 한다.
+    반환: (candidates_by_group, present_dongs)
+    present_dongs는 needed_dongs 중 이 csv에 실제로 존재하는 법정동명 집합이다.
+    ("csv에 해당 법정동이 있는지" 판단에 쓴다. 없으면 과거 법정동으로 회귀한다.)
 """
-def _load_candidates_by_dong(region: str, csv_path: str, needed_dongs: set) -> dict:
+def _load_candidates_by_dong(region: str, csv_path: str, needed_dongs: set) -> tuple:
     candidate_chunks = []
     for chunk in pd.read_csv(
         csv_path, encoding=CSV_ENCODING, dtype=str, usecols=CSV_USECOLS, chunksize=CSV_CHUNK_SIZE
@@ -145,6 +197,7 @@ def _load_candidates_by_dong(region: str, csv_path: str, needed_dongs: set) -> d
             candidate_chunks.append(sub)
     candidates = pd.concat(candidate_chunks, ignore_index=True)
     candidates = candidates.dropna(subset=["지번"]).copy()
+    present_dongs = set(candidates["법정동명"].unique())
     # 지번은 "본번-부번" 형태이므로, 자리수/접두어 비교에 쓸 본번만 분리해둔다.
     candidates["본번"] = candidates["지번"].str.split("-", n=1).str[0]
     # row마다 다시 계산하지 않도록 본번 자리수를 미리 구해둔다.
@@ -156,13 +209,29 @@ def _load_candidates_by_dong(region: str, csv_path: str, needed_dongs: set) -> d
     print(f"[{region}] 토지 특성정보 후보 건수(대상 법정동 내): {len(candidates)}")
 
     group_keys = ["법정동명", "산여부"]
-    return {key: df for key, df in candidates.groupby(group_keys)}
+    return {key: df for key, df in candidates.groupby(group_keys)}, present_dongs
 
 """ 실질적인 매핑 로직
+    실거래 법정동(최신)이 csv에 없으면 변경 이력을 거꾸로 따라가 csv에 있는 과거 법정동으로 조회한다.
+    (PNU/확정번지는 csv에서 찾은 과거 값을 그대로 쓰고, 실제 조회한 법정동명은 조회법정동 컬럼에 남긴다.)
 """
-def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actual_target_count: int, cancelled_count: int, small_area_count: int, share_count: int, candidates_by_group: dict) -> dict:
+def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actual_target_count: int, cancelled_count: int, small_area_count: int, share_count: int, candidates_by_group: dict, present_dongs: set, reverse_map: dict) -> dict:
     land_total_count = actual_target_count - share_count  # 특정토지 전체 거래 건수
 
+    # 실거래 법정동 -> 이 csv에서 조회할 법정동 (같은 법정동이 반복되므로 캐시)
+    lookup_dong_cache = {}
+
+    def resolve_lookup_dong(dong):
+        if dong not in lookup_dong_cache:
+            lookup = None
+            for name in [dong] + _ancestors(dong, reverse_map):
+                if name in present_dongs:
+                    lookup = name
+                    break
+            lookup_dong_cache[dong] = lookup
+        return lookup_dong_cache[dong]
+
+    matched_lookup_dong = []
     matched_pnu = []
     matched_beonji = []
     matched_area = []
@@ -171,6 +240,7 @@ def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actua
         # 0. 번지가 비어있는(NaN) 행은 매칭 불가능하므로 바로 실패 처리한다.
         #    (예: 경상북도 데이터의 포항시 북구 흥해읍 곡강리 건처럼 원본에 번지 누락이 있는 경우)
         if pd.isna(row.번지):
+            matched_lookup_dong.append(None)
             matched_pnu.append(None)
             matched_beonji.append(None)
             matched_area.append(None)
@@ -186,8 +256,11 @@ def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actua
         #    (도로조건은 여기서 제외하고, 5번 단계에서 후보가 2건 이상일 때만 서브조건으로 적용한다.)
         #    (이 조건들은 row마다 값이 그대로 반복되므로, candidates_by_group을 만들 때 미리
         #    groupby 해뒀다. 매칭에 실패할 조합이면 딕셔너리에 아예 없으므로 후보군이 없다.)
-        candidates = candidates_by_group.get((row.시군구, is_san))
+        #    실거래 법정동이 csv에 없으면(법정동 개편 등 시점 차이) 과거 법정동으로 회귀해 조회한다.
+        lookup_dong = resolve_lookup_dong(row.시군구)
+        candidates = None if lookup_dong is None else candidates_by_group.get((lookup_dong, is_san))
         if candidates is None:
+            matched_lookup_dong.append(None)
             matched_pnu.append(None)
             matched_beonji.append(None)
             matched_area.append(None)
@@ -227,6 +300,7 @@ def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actua
 
         # 7. 최종 후보가 정확히 1건일 때만 매칭 확정(PNU/실제 번지 확정)한다.
         if len(hits) == 1:
+            matched_lookup_dong.append(lookup_dong)
             matched_pnu.append(hits["고유번호"].iloc[0])
             beonji = hits["지번"].iloc[0]
             if is_san:
@@ -235,6 +309,7 @@ def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actua
             matched_area.append(hits["토지면적"].iloc[0])
             matched_official_price.append(hits["공시지가"].iloc[0])
         else:
+            matched_lookup_dong.append(None)
             matched_pnu.append(None)
             matched_beonji.append(None)
             matched_area.append(None)
@@ -244,12 +319,15 @@ def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actua
     deals["확정번지"] = matched_beonji
     deals["토지면적"] = matched_area
     deals["공시지가"] = matched_official_price
+    # 조회법정동: 실제로 토지특성정보를 조회한 법정동명(과거 법정동으로 회귀했다면 과거 이름)
+    deals["조회법정동"] = matched_lookup_dong
 
     success_count = deals["PNU"].notna().sum()
+    regressed_count = (deals["조회법정동"].notna() & (deals["조회법정동"] != deals["시군구"])).sum()
     share_deal_mask = deals["지분구분"] == "지분"
     share_success_count = (share_deal_mask & deals["PNU"].notna()).sum()  # 지분거래 매칭 성공 건수
     land_success_count = (~share_deal_mask & deals["PNU"].notna()).sum()
-    print(f"[{region}] {os.path.basename(xlsx_path)} 매칭 성공 건수: {success_count} / {actual_target_count}")
+    print(f"[{region}] {os.path.basename(xlsx_path)} 매칭 성공 건수: {success_count} / {actual_target_count} (그중 과거 법정동 회귀 매칭 {regressed_count}건)")
     print(f"[{region}] {os.path.basename(xlsx_path)} 지분거래 매칭 성공 건수: {share_success_count} / {share_count}")
     print(f"[{region}] {os.path.basename(xlsx_path)} 특정토지 전체 거래 매칭 성공 건수: {land_success_count} / {land_total_count}")
 
@@ -298,8 +376,12 @@ def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actua
         "output": output_path,
     }
 
-"""같은 지역의 xlsx 여러 개가 csv 1개를 공유하므로, csv는 지역당 한 번만 읽고 xlsx만 반복 처리한다."""
-def process_region_group(region: str, xlsx_paths, csv_path: str) -> list:
+"""같은 지역의 xlsx 여러 개가 csv 1개를 공유하므로, csv는 지역당 한 번만 읽고 xlsx만 반복 처리한다.
+
+    실거래 법정동이 csv에 없으면 reverse_map(법정동 변경 이력)으로 과거 법정동에 회귀해 조회하므로,
+    csv에서 걸러 둘 법정동(needed_dongs)에 과거 법정동명도 함께 넣는다.
+"""
+def process_region_group(region: str, xlsx_paths, csv_path: str, reverse_map: dict) -> list:
     loaded = []
     needed_dongs = set()
     for xlsx_path in xlsx_paths:
@@ -312,7 +394,9 @@ def process_region_group(region: str, xlsx_paths, csv_path: str) -> list:
         print(f"[{region}] {os.path.basename(xlsx_path)} 해제사유발생일 있어 제외된 건수: {cancelled_count}")
         print(f"[{region}] {os.path.basename(xlsx_path)} 계약면적 30이하로 제외된 건수: {small_area_count}")
         print(f"[{region}] {os.path.basename(xlsx_path)} 지분 거래 건수: {share_count}")
-        needed_dongs |= set(deals["시군구"].unique())
+        for dong in deals["시군구"].unique():
+            needed_dongs.add(dong)
+            needed_dongs.update(_ancestors(dong, reverse_map))
         loaded.append((xlsx_path, deals, total_count, actual_target_count, cancelled_count, small_area_count, share_count))
 
     if not loaded:
@@ -321,7 +405,7 @@ def process_region_group(region: str, xlsx_paths, csv_path: str) -> list:
     # 실거래가에 등장하는 시군구(법정동명)만 후보로 남기면 되므로, CSV 전체를 메모리에 올리지 않고
     # 청크 단위로 읽으면서 법정동명이 일치하는 행만 추려낸다. 이 지역의 xlsx 전체에서 필요한 동을
     # 먼저 모아뒀기 때문에 CSV는 이 한 번만 읽으면 된다.
-    candidates_by_group = _load_candidates_by_dong(region, csv_path, needed_dongs)
+    candidates_by_group, present_dongs = _load_candidates_by_dong(region, csv_path, needed_dongs)
 
     summaries = []
     # loaded에서 하나씩 꺼내 처리 즉시 참조를 없애, 처리 끝난 xlsx의 데이터가 다음 xlsx 처리 중에도
@@ -329,7 +413,7 @@ def process_region_group(region: str, xlsx_paths, csv_path: str) -> list:
     while loaded:
         xlsx_path, deals, total_count, actual_target_count, cancelled_count, small_area_count, share_count = loaded.pop(0)
         try:
-            summaries.append(_match_and_write(region, xlsx_path, deals, total_count, actual_target_count, cancelled_count, small_area_count, share_count, candidates_by_group))
+            summaries.append(_match_and_write(region, xlsx_path, deals, total_count, actual_target_count, cancelled_count, small_area_count, share_count, candidates_by_group, present_dongs, reverse_map))
         except Exception as e:
             print(f"[{region}] {xlsx_path} 매칭 처리 실패로 건너뜀: {e}")
         finally:
@@ -337,7 +421,7 @@ def process_region_group(region: str, xlsx_paths, csv_path: str) -> list:
             gc.collect()
 
     # 이 지역의 CSV 후보(candidates_by_group)는 다음 지역 처리 전에 해제한다.
-    del candidates_by_group
+    del candidates_by_group, present_dongs
     gc.collect()
     return summaries
 
@@ -348,11 +432,14 @@ def main():
         print("처리할 지역 파일 쌍을 찾지 못했습니다.")
         return
 
+    # 법정동 변경 이력(최신 -> 과거 역방향)은 전 지역 공통이므로 한 번만 읽는다.
+    reverse_map = _load_bjd_reverse_map()
+
     # 실질적인 처리및 매핑로직은 메서드 process_region_group에 다 들어있음
     summaries = []
     for region, (xlsx_paths, csv_path) in region_files.items():
         try:
-            summaries.extend(process_region_group(region, xlsx_paths, csv_path))
+            summaries.extend(process_region_group(region, xlsx_paths, csv_path, reverse_map))
         except Exception as e:
             print(f"[{region}] 처리 중 오류로 건너뜀: {e}")
 
