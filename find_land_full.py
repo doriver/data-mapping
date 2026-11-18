@@ -4,6 +4,7 @@
 import gc
 import glob
 import os
+import re
 import sys
 
 import numpy as np
@@ -33,6 +34,11 @@ HEADER_ROW = 12  # 실제 표 헤더가 있는 엑셀 행(0-index)
 OUTPUT_DIR = r"D:\dev\data\processed\traded_land_processed\25"
 DATA_START_ROW = 5  # 0-index. 상단 4행(전체/제외/처리대상/성공 건수) + 빈 줄을 남기고 그 아래부터 표 작성
 AREA_TOLERANCE = 0.01
+# 실거래 용도지역 -> 토지특성정보 용도지역명1 별칭. 같은 용도지역인데 표기가 다른 경우 비교 전에 맞춘다.
+# (실거래는 "자연환경보전", 토지특성정보는 "자연환경보전지역"으로 표기)
+USE_ZONE_ALIASES = {
+    "자연환경보전": "자연환경보전지역",
+}
 EMPTY_VALUE = "-"  # 실제 거래된거를 나타내는 값( 해제된경우는 날짜 들어가있음 )
 ROAD_CONDITION_TO_ROAD_SIDE_CODES = {
     "25m이상": {"01", "02", "03"},
@@ -63,6 +69,18 @@ def _match_region(filename: str):
             return region
     return None
 
+"""법정동명을 비교용으로 정규화한다. (실거래 시군구, 토지특성 법정동명, 법정동 변경 이력 이름에 공통 적용)
+
+    - 앞뒤 공백 제거
+    - 텍스트 사이 연속 공백(2칸 이상, 탭/전각 공백 포함)을 한 칸으로
+    문자열이 아니면(NaN 등) 그대로 반환한다.
+    예: "  경기도 화성시   새솔동 " -> "경기도 화성시 새솔동"
+"""
+def _normalize_dong_name(name):
+    if not isinstance(name, str):
+        return name
+    return re.sub(r"\s+", " ", name.strip())
+
 """법정동 변경 이력 csv를 읽어 {최신 법정동명: {과거 법정동명, ...}} 역방향 dict를 만든다.
 
     이름은 "시도 시군구 읍면동 [리]"를 공백으로 이은 전체 이름이다(실거래 시군구, csv 법정동명과 같은 형식).
@@ -81,7 +99,7 @@ def _load_bjd_reverse_map() -> dict:
 
     def full_name(row, side):
         parts = [row[f"{side}_{level}_nm"] for level in ("sido", "sgg", "emd", "ri")]
-        return " ".join(p.strip() for p in parts if isinstance(p, str) and p.strip())
+        return _normalize_dong_name(" ".join(p.strip() for p in parts if isinstance(p, str) and p.strip()))
 
     reverse_map = {}
     for _, row in history.iterrows():
@@ -193,6 +211,11 @@ def _load_candidates_by_dong(region: str, csv_path: str, needed_dongs: set) -> t
     for chunk in pd.read_csv(
         csv_path, encoding=CSV_ENCODING, dtype=str, usecols=CSV_USECOLS, chunksize=CSV_CHUNK_SIZE
     ):
+        # 실거래 시군구와 같은 기준으로 비교하도록 법정동명을 정규화한다.
+        # (청크 안 고유 법정동명은 수백 개 수준이므로, 고유값만 정규화해 map으로 펼친다.)
+        dong_names = chunk["법정동명"]
+        normalized = {name: _normalize_dong_name(name) for name in dong_names.dropna().unique()}
+        chunk["법정동명"] = dong_names.map(normalized)
         sub = chunk[chunk["법정동명"].isin(needed_dongs)]
         if len(sub):
             candidate_chunks.append(sub)
@@ -222,15 +245,17 @@ def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actua
     # 실거래 법정동 -> 이 csv에서 조회할 법정동 (같은 법정동이 반복되므로 캐시)
     lookup_dong_cache = {}
 
-    def resolve_lookup_dong(dong):
-        if dong not in lookup_dong_cache:
+    def resolve_lookup_dong(raw_dong):
+        if raw_dong not in lookup_dong_cache:
             lookup = None
+            # csv 법정동명(present_dongs)도 정규화돼 있으므로 실거래 시군구도 정규화한 뒤 비교한다.
+            dong = _normalize_dong_name(raw_dong)
             for name in [dong] + _ancestors(dong, reverse_map):
                 if name in present_dongs:
                     lookup = name
                     break
-            lookup_dong_cache[dong] = lookup
-        return lookup_dong_cache[dong]
+            lookup_dong_cache[raw_dong] = lookup
+        return lookup_dong_cache[raw_dong]
 
     # (조회법정동, 산여부, 자리수) -> 자리수까지 맞는 후보 DataFrame
     # (조회법정동, 산여부, 자리수, 접두어) -> 3번 조건까지 통과한 후보의 numpy 배열 묶음
@@ -311,7 +336,9 @@ def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actua
             mask = area >= row.계약면적
 
         # 5. [중요조건] 용도지역 또는 지목 중 하나라도 일치해야 한다.
-        mask &= (candidates["지목명"] == row.지목) | (candidates["용도지역명1"] == row.용도지역)
+        #    (실거래 용도지역은 USE_ZONE_ALIASES로 토지특성정보 표기에 맞춘 뒤 비교한다. 결과 엑셀의 원본 값은 그대로 둔다.)
+        use_zone = USE_ZONE_ALIASES.get(row.용도지역, row.용도지역)
+        mask &= (candidates["지목명"] == row.지목) | (candidates["용도지역명1"] == use_zone)
         # hits: 조건을 통과한 후보의 위치(index) 배열
         hits = np.flatnonzero(mask)
 
@@ -322,7 +349,7 @@ def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actua
         #    (모든 서브조건을 거친 뒤에도 2건 이상이면 특정할 수 없으므로 매칭하지 않는다.)
         sub_filters = [
             lambda idx: candidates["도로조건"][idx] == row.도로조건,
-            lambda idx: (candidates["지목명"][idx] == row.지목) & (candidates["용도지역명1"][idx] == row.용도지역),
+            lambda idx: (candidates["지목명"][idx] == row.지목) & (candidates["용도지역명1"][idx] == use_zone),
         ]
         for sub_filter in sub_filters:
             if len(hits) < 2: # 서브조건을 적용하기 전에 먼저 건수를 확인
@@ -355,7 +382,8 @@ def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actua
     deals["조회법정동"] = matched_lookup_dong
 
     success_count = deals["PNU"].notna().sum()
-    regressed_count = (deals["조회법정동"].notna() & (deals["조회법정동"] != deals["시군구"])).sum()
+    # 공백 차이만 있는 경우를 회귀로 세지 않도록 시군구도 정규화해서 비교한다.
+    regressed_count = (deals["조회법정동"].notna() & (deals["조회법정동"] != deals["시군구"].map(_normalize_dong_name))).sum()
     share_deal_mask = deals["지분구분"] == "지분"
     share_success_count = (share_deal_mask & deals["PNU"].notna()).sum()  # 지분거래 매칭 성공 건수
     land_success_count = (~share_deal_mask & deals["PNU"].notna()).sum()
@@ -426,7 +454,9 @@ def process_region_group(region: str, xlsx_paths, csv_path: str, reverse_map: di
         print(f"[{region}] {os.path.basename(xlsx_path)} 해제사유발생일 있어 제외된 건수: {cancelled_count}")
         print(f"[{region}] {os.path.basename(xlsx_path)} 계약면적 30이하로 제외된 건수: {small_area_count}")
         print(f"[{region}] {os.path.basename(xlsx_path)} 지분 거래 건수: {share_count}")
-        for dong in deals["시군구"].unique():
+        for raw_dong in deals["시군구"].dropna().unique():
+            # csv 법정동명과 같은 기준으로 비교하도록 정규화한 이름으로 키를 만든다.
+            dong = _normalize_dong_name(raw_dong)
             needed_dongs.add(dong)
             needed_dongs.update(_ancestors(dong, reverse_map))
         loaded.append((xlsx_path, deals, total_count, actual_target_count, cancelled_count, small_area_count, share_count))
