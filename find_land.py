@@ -57,7 +57,7 @@ CSV_USECOLS = ["고유번호", "법정동명", "지번", "지목명", "용도지
 # 후보 메모리를 줄이기 위해 반복값이 많은 문자열 컬럼은 category로 변환한다.
 CANDIDATE_CATEGORY_COLS = ["법정동명", "지목명", "용도지역명1", "도로조건"]
 HEADER_ROW = 12  # 실제 표 헤더가 있는 엑셀 행(0-index)
-OUTPUT_DIR = r"D:\dev\data\traded_land_processed\25"
+OUTPUT_DIR = r"D:\dev\data\processed\traded_land_processed\25"
 DATA_START_ROW = 6  # 0-index. 상단 5행(전체/제외/지분/전체거래/연도별 통계) + 빈 줄을 남기고 그 아래부터 표 작성
 AREA_TOLERANCE = 0.01
 EMPTY_VALUE = "-"  # 실제 거래된거를 나타내는 값( 해제된경우는 날짜 들어가있음 )
