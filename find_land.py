@@ -9,6 +9,7 @@ import os
 import sys
 import time
 
+import numpy as np
 import pandas as pd
 
 if sys.stdout.encoding.lower() != "utf-8":
@@ -329,6 +330,36 @@ def _match_deals(deals, candidates_by_group: dict, present_dongs: set, reverse_m
             lookup_dong_cache[dong] = lookup
         return lookup_dong_cache[dong]
 
+    # (조회법정동, 산여부, 자리수) -> 자리수까지 맞는 후보 DataFrame
+    # (조회법정동, 산여부, 자리수, 접두어) -> 3번 조건까지 통과한 후보의 numpy 배열 묶음
+    # 같은 법정동/자리수/접두어 조합이 여러 행에서 반복되므로, 후보 전체 필터링은 조합마다 한 번만 하고
+    # 행마다는 작아진 numpy 배열에서 면적/지목/용도지역/도로조건만 비교한다.
+    digit_cache = {}
+    prefix_cache = {}
+
+    def get_candidate_arrays(lookup_dong, is_san, digit_count, prefix):
+        key = (lookup_dong, is_san, digit_count, prefix)
+        if key not in prefix_cache:
+            digit_key = (lookup_dong, is_san, digit_count)
+            if digit_key not in digit_cache:
+                group = candidates_by_group.get((lookup_dong, is_san))
+                digit_cache[digit_key] = None if group is None else group[group["본번_자리수"] == digit_count]
+            by_digit = digit_cache[digit_key]
+            if by_digit is None:
+                prefix_cache[key] = None
+            else:
+                sub = by_digit[by_digit["본번"].str.startswith(prefix)]
+                prefix_cache[key] = {
+                    "고유번호": sub["고유번호"].to_numpy(dtype=object),
+                    "지번": sub["지번"].to_numpy(dtype=object),
+                    "토지면적": sub["토지면적"].to_numpy(dtype=float),
+                    "공시지가": sub["공시지가"].to_numpy(dtype=float),
+                    "지목명": sub["지목명"].to_numpy(dtype=object),
+                    "용도지역명1": sub["용도지역명1"].to_numpy(dtype=object),
+                    "도로조건": sub["도로조건"].to_numpy(dtype=object),
+                }
+        return prefix_cache[key]
+
     matched_idx = []
     matched_lookup_dong = []
     matched_pnu = []
@@ -354,26 +385,26 @@ def _match_deals(deals, candidates_by_group: dict, present_dongs: set, reverse_m
         lookup_dong = resolve_lookup_dong(row.시군구)
         if lookup_dong is None:
             continue
-        candidates = candidates_by_group.get((lookup_dong, is_san))
-        if candidates is None:
-            continue
 
         # 3. [중요조건] 토지 특성정보의 본번이 접두어로 시작하고, 마스킹 전 번지와 자리수가 같아야 한다.
         #    (자리수까지 맞춰야 "1**"가 "12" 같은 다른 자리수 번지와 잘못 매칭되지 않는다.)
-        mask = (candidates["본번_자리수"] == digit_count) & candidates["본번"].str.startswith(prefix)
+        #    (이 조건도 row마다 값이 반복되므로 get_candidate_arrays에서 조합별로 한 번만 계산해 캐시한다.)
+        candidates = get_candidate_arrays(lookup_dong, is_san, digit_count, prefix)
+        if candidates is None or not len(candidates["고유번호"]):
+            continue
 
         # 4. [중요조건] 면적 조건: 지분구분이 없는 단독 거래는 계약면적과 오차범위 내로 일치해야 하고,
         #    지분 거래는 토지 전체 면적 중 일부만 거래된 것이므로 토지면적이 계약면적 이상이어야 한다.
+        area = candidates["토지면적"]
         if pd.isna(row.지분구분):
-            mask &= (candidates["토지면적"] > row.계약면적 - AREA_TOLERANCE) & (
-                candidates["토지면적"] < row.계약면적 + AREA_TOLERANCE
-            )
+            mask = (area > row.계약면적 - AREA_TOLERANCE) & (area < row.계약면적 + AREA_TOLERANCE)
         else:
-            mask &= candidates["토지면적"] >= row.계약면적
+            mask = area >= row.계약면적
 
         # 5. [중요조건] 용도지역 또는 지목 중 하나라도 일치해야 한다.
         mask &= (candidates["지목명"] == row.지목) | (candidates["용도지역명1"] == row.용도지역)
-        hits = candidates[mask]
+        # hits: 조건을 통과한 후보의 위치(index) 배열
+        hits = np.flatnonzero(mask)
 
         # 6. [서브조건] 중요조건을 만족하는 후보가 1건이면 바로 매칭 확정.
         #    2건 이상이면(중요조건만으로 특정 불가) 아래 서브조건을 순서대로 하나씩 적용해 다시 좁힌다.
@@ -381,8 +412,8 @@ def _match_deals(deals, candidates_by_group: dict, present_dongs: set, reverse_m
         #    각 단계에서 1건이 되면 확정, 0건이면 실패, 2건 이상이면 다음 서브조건으로 넘어간다.
         #    (모든 서브조건을 거친 뒤에도 2건 이상이면 특정할 수 없으므로 매칭하지 않는다.)
         sub_filters = [
-            lambda df: df["도로조건"] == row.도로조건,
-            lambda df: (df["지목명"] == row.지목) & (df["용도지역명1"] == row.용도지역),
+            lambda idx: candidates["도로조건"][idx] == row.도로조건,
+            lambda idx: (candidates["지목명"][idx] == row.지목) & (candidates["용도지역명1"][idx] == row.용도지역),
         ]
         for sub_filter in sub_filters:
             if len(hits) < 2: # 서브조건을 적용하기 전에 먼저 건수를 확인
@@ -391,15 +422,16 @@ def _match_deals(deals, candidates_by_group: dict, present_dongs: set, reverse_m
 
         # 7. 최종 후보가 정확히 1건일 때만 매칭 확정(PNU/실제 번지 확정)한다.
         if len(hits) == 1:
+            hit = hits[0]
             matched_idx.append(row.Index)
             matched_lookup_dong.append(lookup_dong)
-            matched_pnu.append(hits["고유번호"].iloc[0])
-            beonji = hits["지번"].iloc[0]
+            matched_pnu.append(candidates["고유번호"][hit])
+            beonji = candidates["지번"][hit]
             if is_san:
                 beonji = f"산 {beonji}"
             matched_beonji.append(beonji)
-            matched_area.append(hits["토지면적"].iloc[0])
-            matched_official_price.append(hits["공시지가"].iloc[0])
+            matched_area.append(candidates["토지면적"][hit])
+            matched_official_price.append(candidates["공시지가"][hit])
 
     if matched_idx:
         deals.loc[matched_idx, "PNU"] = matched_pnu
