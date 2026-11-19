@@ -13,15 +13,29 @@ import pandas as pd
 if sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-RAW_DIR = r"D:\dev\data\raw\traded_land_raw\25"
+RAW_DIR = r"D:\dev\data\raw\traded_land_raw"
 BASIS_DIR = r"D:\dev\data\basis\land_characteristics\26"
 # 파일명이 이 이름들 중 하나로 시작하면 해당 지역으로 판별한다.
 # (예: "서울25년_토지(매매)_실거래가.xlsx", "서울토지특성정보_20260519.csv" -> "서울")
 # 실제 파일명 규칙이 다르면 이 목록만 조정하면 된다.
+# 현재 파일명은 시도 정식명칭으로 시작한다.
+# (예: "서울특별시_2025_토지_실거래가.xlsx", "서울특별시_토지특성정보_2025-01-23.csv" -> "서울특별시")
+# 실거래가는 전남/광주가 "전남광주통합특별시" 1개 파일이고, 토지특성정보는 "전라남도"/"광주광역시"로 나뉘어 있다.
 REGION_NAMES = [
-    "서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종",
-    "경기", "강원", "충청북", "충북", "충청남", "충남", "전북", "전라남", "전남", "경상북", "경북", "경상남", "경남", "제주",
+    "서울특별시", "부산광역시", "대구광역시", "인천광역시", "광주광역시", "대전광역시", "울산광역시", "세종특별자치시",
+    "경기도", "강원특별자치도", "충청북도", "충청남도", "전북특별자치도", "전라남도", "전남광주통합특별시",
+    "경상북도", "경상남도", "제주특별자치도",
 ]
+# 실거래 지역 1개에 토지특성정보 csv 여러 개를 짝지어야 하는 예외 지역.
+# 실거래 "전남광주통합특별시"는 토지특성정보 "전라남도", "광주광역시" csv 2개를 함께 읽어 모집단으로 쓴다.
+# 여기 없는 지역은 실거래 지역명과 같은 이름의 csv 1개와 짝짓는다.
+DEAL_REGION_TO_CSV_REGIONS = {
+    "전남광주통합특별시": ["전라남도", "광주광역시"],
+}
+# 법정동명 비교 시 맨 앞 '시도' 단어를 떼고 비교하는 실거래 지역.
+# 실거래는 "전남광주통합특별시 ...", 토지특성정보는 "전라남도 ..."/"광주광역시 ..."로 시도명이 달라
+# 시도를 뺀 "시군구 읍면동 [리]"만으로 비교한다.
+SIDO_STRIP_REGIONS = {"전남광주통합특별시"}
 # 법정동 변경 이력. 실거래는 최신 법정동명, 토지특성정보는 해당 연도 시점 법정동명을 쓰므로
 # csv에 실거래 법정동이 없으면 이 이력을 거꾸로 따라가 과거 법정동명으로 다시 조회한다.
 BJD_CHANGE_DIR = r"D:\dev\data\basis\bjd_change"
@@ -31,7 +45,7 @@ CSV_ENCODING = "cp949"
 CSV_CHUNK_SIZE = 200_000
 CSV_USECOLS = ["고유번호", "법정동명", "지번", "지목명", "용도지역명1", "토지면적", "대장구분명", "공시지가", "도로접면코드"]
 HEADER_ROW = 12  # 실제 표 헤더가 있는 엑셀 행(0-index)
-OUTPUT_DIR = r"D:\dev\data\processed\traded_land_processed\25"
+OUTPUT_DIR = r"D:\dev\data\processed\traded_land_processed"
 DATA_START_ROW = 5  # 0-index. 상단 4행(전체/제외/처리대상/성공 건수) + 빈 줄을 남기고 그 아래부터 표 작성
 AREA_TOLERANCE = 0.01
 # 실거래 용도지역 -> 토지특성정보 용도지역명1 별칭. 같은 용도지역인데 표기가 다른 경우 비교 전에 맞춘다.
@@ -81,6 +95,19 @@ def _normalize_dong_name(name):
         return name
     return re.sub(r"\s+", " ", name.strip())
 
+"""법정동명을 비교 키로 만든다. 정규화한 뒤, strip_sido면 맨 앞 '시도' 단어를 뗀다.
+
+    SIDO_STRIP_REGIONS 지역(전남광주통합특별시)에서만 strip_sido=True로 쓴다.
+    예: "전남광주통합특별시 광산구 도산동" -> "광산구 도산동", "광주광역시 광산구 도산동" -> "광산구 도산동"
+    문자열이 아니면(NaN 등) 그대로 반환한다.
+"""
+def _dong_compare_key(name, strip_sido: bool):
+    name = _normalize_dong_name(name)
+    if not strip_sido or not isinstance(name, str):
+        return name
+    parts = name.split(" ", 1)
+    return parts[1] if len(parts) == 2 else name
+
 """법정동 변경 이력 csv를 읽어 {최신 법정동명: {과거 법정동명, ...}} 역방향 dict를 만든다.
 
     이름은 "시도 시군구 읍면동 [리]"를 공백으로 이은 전체 이름이다(실거래 시군구, csv 법정동명과 같은 형식).
@@ -129,8 +156,10 @@ def _ancestors(dong: str, reverse_map: dict) -> list:
 
     같은 지역의 실거래가 xlsx는 (기간 등에 따라)여러 개 있을 수 있으므로 개수 제한 없이 모두 모으고,
     해당 지역의 토지특성정보 csv 1개를 공통으로 매칭해 각 xlsx마다 개별 처리·출력한다.
+    단, DEAL_REGION_TO_CSV_REGIONS에 있는 지역(전남광주통합특별시)은 csv 여러 개를 모두 짝짓는다.
+    반환: {실거래 지역명: (xlsx 경로 리스트, csv 경로 리스트)}
 """
-def discover_region_files():    
+def discover_region_files():
     xlsx_by_region = {}
     for path in glob.glob(os.path.join(RAW_DIR, "*.xlsx")):
         region = _match_region(os.path.basename(path))
@@ -149,14 +178,19 @@ def discover_region_files():
             raise ValueError(f"'{region}' 지역의 토지특성정보 파일이 2개 이상 발견됨: {csv_by_region[region]}, {path}")
         csv_by_region[region] = path
 
+    # 다른 실거래 지역에 묶여 들어가는 csv 지역(전라남도, 광주광역시)은 단독 지역으로 짝을 찾지 않는다.
+    merged_csv_regions = {r for csv_regions in DEAL_REGION_TO_CSV_REGIONS.values() for r in csv_regions}
+
     region_files = {}
-    for region in xlsx_by_region.keys() | csv_by_region.keys():
+    for region in xlsx_by_region.keys() | (csv_by_region.keys() - merged_csv_regions):
         xlsx_paths = xlsx_by_region.get(region)
-        csv_path = csv_by_region.get(region)
-        if not xlsx_paths or csv_path is None:
-            print(f"건너뜀: '{region}' 지역은 xlsx/csv 짝이 없음 (xlsx={xlsx_paths}, csv={csv_path})")
+        csv_regions = DEAL_REGION_TO_CSV_REGIONS.get(region, [region])
+        csv_paths = [csv_by_region[r] for r in csv_regions if r in csv_by_region]
+        # 묶어야 하는 csv 중 하나라도 없으면 모집단이 불완전하므로 짝이 없는 것으로 본다.
+        if not xlsx_paths or len(csv_paths) != len(csv_regions):
+            print(f"건너뜀: '{region}' 지역은 xlsx/csv 짝이 없음 (xlsx={xlsx_paths}, csv={csv_paths}, 필요 csv 지역={csv_regions})")
             continue
-        region_files[region] = (xlsx_paths, csv_path)
+        region_files[region] = (xlsx_paths, csv_paths)
     return region_files
 
 
@@ -205,20 +239,23 @@ def _load_deals(xlsx_path: str):
     반환: (candidates_by_group, present_dongs)
     present_dongs는 needed_dongs 중 이 csv에 실제로 존재하는 법정동명 집합이다.
     ("csv에 해당 법정동이 있는지" 판단에 쓴다. 없으면 과거 법정동으로 회귀한다.)
+    csv_paths가 여러 개(전남광주통합특별시 -> 전라남도 + 광주광역시)면 모두 읽어 하나의 후보군(모집단)으로 합친다.
+    strip_sido면 법정동명에서 시도를 뗀 비교 키(_dong_compare_key)로 바꿔 둔다. (needed_dongs도 같은 키여야 한다.)
 """
-def _load_candidates_by_dong(region: str, csv_path: str, needed_dongs: set) -> tuple:
+def _load_candidates_by_dong(region: str, csv_paths: list, needed_dongs: set, strip_sido: bool = False) -> tuple:
     candidate_chunks = []
-    for chunk in pd.read_csv(
-        csv_path, encoding=CSV_ENCODING, dtype=str, usecols=CSV_USECOLS, chunksize=CSV_CHUNK_SIZE
-    ):
-        # 실거래 시군구와 같은 기준으로 비교하도록 법정동명을 정규화한다.
-        # (청크 안 고유 법정동명은 수백 개 수준이므로, 고유값만 정규화해 map으로 펼친다.)
-        dong_names = chunk["법정동명"]
-        normalized = {name: _normalize_dong_name(name) for name in dong_names.dropna().unique()}
-        chunk["법정동명"] = dong_names.map(normalized)
-        sub = chunk[chunk["법정동명"].isin(needed_dongs)]
-        if len(sub):
-            candidate_chunks.append(sub)
+    for csv_path in csv_paths:
+        for chunk in pd.read_csv(
+            csv_path, encoding=CSV_ENCODING, dtype=str, usecols=CSV_USECOLS, chunksize=CSV_CHUNK_SIZE
+        ):
+            # 실거래 시군구와 같은 기준으로 비교하도록 법정동명을 정규화한다.
+            # (청크 안 고유 법정동명은 수백 개 수준이므로, 고유값만 정규화해 map으로 펼친다.)
+            dong_names = chunk["법정동명"]
+            normalized = {name: _dong_compare_key(name, strip_sido) for name in dong_names.dropna().unique()}
+            chunk["법정동명"] = dong_names.map(normalized)
+            sub = chunk[chunk["법정동명"].isin(needed_dongs)]
+            if len(sub):
+                candidate_chunks.append(sub)
     candidates = pd.concat(candidate_chunks, ignore_index=True)
     candidates = candidates.dropna(subset=["지번"]).copy()
     present_dongs = set(candidates["법정동명"].unique())
@@ -237,9 +274,10 @@ def _load_candidates_by_dong(region: str, csv_path: str, needed_dongs: set) -> t
 
 """ 실질적인 매핑 로직
     실거래 법정동(최신)이 csv에 없으면 변경 이력을 거꾸로 따라가 csv에 있는 과거 법정동으로 조회한다.
-    (PNU/확정번지는 csv에서 찾은 과거 값을 그대로 쓰고, 실제 조회한 법정동명은 조회법정동 컬럼에 남긴다.)
+    (PNU/확정번지는 csv에서 찾은 과거 값을 그대로 쓴다.)
+    strip_sido면 법정동명을 시도를 뗀 비교 키(_dong_compare_key)로 비교한다. (전남광주통합특별시)
 """
-def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actual_target_count: int, cancelled_count: int, small_area_count: int, share_count: int, candidates_by_group: dict, present_dongs: set, reverse_map: dict) -> dict:
+def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actual_target_count: int, cancelled_count: int, small_area_count: int, share_count: int, candidates_by_group: dict, present_dongs: set, reverse_map: dict, strip_sido: bool = False) -> dict:
     land_total_count = actual_target_count - share_count  # 특정토지 전체 거래 건수
 
     # 실거래 법정동 -> 이 csv에서 조회할 법정동 (같은 법정동이 반복되므로 캐시)
@@ -250,9 +288,11 @@ def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actua
             lookup = None
             # csv 법정동명(present_dongs)도 정규화돼 있으므로 실거래 시군구도 정규화한 뒤 비교한다.
             dong = _normalize_dong_name(raw_dong)
+            # 변경 이력은 시도까지 포함한 전체 이름으로 따라가고, present_dongs와는 비교 키로 비교한다.
             for name in [dong] + _ancestors(dong, reverse_map):
-                if name in present_dongs:
-                    lookup = name
+                key = _dong_compare_key(name, strip_sido)
+                if key in present_dongs:
+                    lookup = key
                     break
             lookup_dong_cache[raw_dong] = lookup
         return lookup_dong_cache[raw_dong]
@@ -378,12 +418,15 @@ def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actua
     deals["확정번지"] = matched_beonji
     deals["토지면적"] = matched_area
     deals["공시지가"] = matched_official_price
-    # 조회법정동: 실제로 토지특성정보를 조회한 법정동명(과거 법정동으로 회귀했다면 과거 이름)
-    deals["조회법정동"] = matched_lookup_dong
 
     success_count = deals["PNU"].notna().sum()
+    # matched_lookup_dong: 매칭 성공 행에서 실제로 토지특성정보를 조회한 법정동명(과거 법정동으로 회귀했다면 과거 이름)
+    # 엑셀 컬럼으로는 남기지 않고, 회귀 매칭 건수 집계에만 사용한다.
     # 공백 차이만 있는 경우를 회귀로 세지 않도록 시군구도 정규화해서 비교한다.
-    regressed_count = (deals["조회법정동"].notna() & (deals["조회법정동"] != deals["시군구"].map(_normalize_dong_name))).sum()
+    regressed_count = sum(
+        1 for lookup, raw_dong in zip(matched_lookup_dong, deals["시군구"])
+        if lookup is not None and lookup != _dong_compare_key(raw_dong, strip_sido)
+    )
     share_deal_mask = deals["지분구분"] == "지분"
     share_success_count = (share_deal_mask & deals["PNU"].notna()).sum()  # 지분거래 매칭 성공 건수
     land_success_count = (~share_deal_mask & deals["PNU"].notna()).sum()
@@ -437,11 +480,14 @@ def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actua
     }
 
 """같은 지역의 xlsx 여러 개가 csv 1개를 공유하므로, csv는 지역당 한 번만 읽고 xlsx만 반복 처리한다.
+    (전남광주통합특별시는 csv_paths에 전라남도/광주광역시 csv 2개가 들어오며, 둘을 합친 후보군을 공유한다.)
 
     실거래 법정동이 csv에 없으면 reverse_map(법정동 변경 이력)으로 과거 법정동에 회귀해 조회하므로,
     csv에서 걸러 둘 법정동(needed_dongs)에 과거 법정동명도 함께 넣는다.
 """
-def process_region_group(region: str, xlsx_paths, csv_path: str, reverse_map: dict) -> list:
+def process_region_group(region: str, xlsx_paths, csv_paths: list, reverse_map: dict) -> list:
+    # 전남광주통합특별시는 실거래/토지특성 시도명이 달라 시도를 떼고 법정동명을 비교한다.
+    strip_sido = region in SIDO_STRIP_REGIONS
     loaded = []
     needed_dongs = set()
     for xlsx_path in xlsx_paths:
@@ -456,9 +502,10 @@ def process_region_group(region: str, xlsx_paths, csv_path: str, reverse_map: di
         print(f"[{region}] {os.path.basename(xlsx_path)} 지분 거래 건수: {share_count}")
         for raw_dong in deals["시군구"].dropna().unique():
             # csv 법정동명과 같은 기준으로 비교하도록 정규화한 이름으로 키를 만든다.
+            # (변경 이력은 시도 포함 전체 이름으로 따라간 뒤, 각 이름을 비교 키로 바꿔 넣는다.)
             dong = _normalize_dong_name(raw_dong)
-            needed_dongs.add(dong)
-            needed_dongs.update(_ancestors(dong, reverse_map))
+            for name in [dong] + _ancestors(dong, reverse_map):
+                needed_dongs.add(_dong_compare_key(name, strip_sido))
         loaded.append((xlsx_path, deals, total_count, actual_target_count, cancelled_count, small_area_count, share_count))
 
     if not loaded:
@@ -467,7 +514,7 @@ def process_region_group(region: str, xlsx_paths, csv_path: str, reverse_map: di
     # 실거래가에 등장하는 시군구(법정동명)만 후보로 남기면 되므로, CSV 전체를 메모리에 올리지 않고
     # 청크 단위로 읽으면서 법정동명이 일치하는 행만 추려낸다. 이 지역의 xlsx 전체에서 필요한 동을
     # 먼저 모아뒀기 때문에 CSV는 이 한 번만 읽으면 된다.
-    candidates_by_group, present_dongs = _load_candidates_by_dong(region, csv_path, needed_dongs)
+    candidates_by_group, present_dongs = _load_candidates_by_dong(region, csv_paths, needed_dongs, strip_sido)
 
     summaries = []
     # loaded에서 하나씩 꺼내 처리 즉시 참조를 없애, 처리 끝난 xlsx의 데이터가 다음 xlsx 처리 중에도
@@ -475,7 +522,7 @@ def process_region_group(region: str, xlsx_paths, csv_path: str, reverse_map: di
     while loaded:
         xlsx_path, deals, total_count, actual_target_count, cancelled_count, small_area_count, share_count = loaded.pop(0)
         try:
-            summaries.append(_match_and_write(region, xlsx_path, deals, total_count, actual_target_count, cancelled_count, small_area_count, share_count, candidates_by_group, present_dongs, reverse_map))
+            summaries.append(_match_and_write(region, xlsx_path, deals, total_count, actual_target_count, cancelled_count, small_area_count, share_count, candidates_by_group, present_dongs, reverse_map, strip_sido))
         except Exception as e:
             print(f"[{region}] {xlsx_path} 매칭 처리 실패로 건너뜀: {e}")
         finally:
@@ -499,9 +546,9 @@ def main():
 
     # 실질적인 처리및 매핑로직은 메서드 process_region_group에 다 들어있음
     summaries = []
-    for region, (xlsx_paths, csv_path) in region_files.items():
+    for region, (xlsx_paths, csv_paths) in region_files.items():
         try:
-            summaries.extend(process_region_group(region, xlsx_paths, csv_path, reverse_map))
+            summaries.extend(process_region_group(region, xlsx_paths, csv_paths, reverse_map))
         except Exception as e:
             print(f"[{region}] 처리 중 오류로 건너뜀: {e}")
 
