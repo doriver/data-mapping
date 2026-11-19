@@ -14,7 +14,15 @@ if sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
 RAW_DIR = r"D:\dev\data\raw\traded_land_raw"
-BASIS_DIR = r"D:\dev\data\basis\land_characteristics\26"
+# (연도, 경로) 목록. 리스트 순서가 곧 매칭 우선순위다.
+# 1차로 첫 연도(26) 토지특성정보로 전체 실거래를 매칭하고, 이후 연도(25 -> 24 -> 23)는 앞 연도까지 매칭 안 된 행만 재매칭한다.
+# 지역마다 한 번에 1개 연도 csv만 메모리에 올리고, 그 연도 매칭이 끝나면 해제한 뒤 다음 연도로 넘어간다.
+BASIS_DIRS = [
+    ("26", r"D:\dev\data\basis\land_characteristics\26"),
+    ("25", r"D:\dev\data\basis\land_characteristics\25"),
+    ("24", r"D:\dev\data\basis\land_characteristics\24"),
+    ("23", r"D:\dev\data\basis\land_characteristics\23"),
+]
 # 파일명이 이 이름들 중 하나로 시작하면 해당 지역으로 판별한다.
 # (예: "서울25년_토지(매매)_실거래가.xlsx", "서울토지특성정보_20260519.csv" -> "서울")
 # 실제 파일명 규칙이 다르면 이 목록만 조정하면 된다.
@@ -152,12 +160,13 @@ def _ancestors(dong: str, reverse_map: dict) -> list:
         frontier = next_frontier
     return result
 
-"""RAW_DIR의 xlsx와 BASIS_DIR의 csv를 파일명 접두어(지역명) 기준으로 짝짓는다.
+"""RAW_DIR의 xlsx와 BASIS_DIRS(연도별)의 csv를 파일명 접두어(지역명) 기준으로 짝짓는다.
 
     같은 지역의 실거래가 xlsx는 (기간 등에 따라)여러 개 있을 수 있으므로 개수 제한 없이 모두 모으고,
-    해당 지역의 토지특성정보 csv 1개를 공통으로 매칭해 각 xlsx마다 개별 처리·출력한다.
-    단, DEAL_REGION_TO_CSV_REGIONS에 있는 지역(전남광주통합특별시)은 csv 여러 개를 모두 짝짓는다.
-    반환: {실거래 지역명: (xlsx 경로 리스트, csv 경로 리스트)}
+    해당 지역의 토지특성정보 csv를 연도별로 공통 매칭해 각 xlsx마다 개별 처리·출력한다.
+    단, DEAL_REGION_TO_CSV_REGIONS에 있는 지역(전남광주통합특별시)은 연도마다 csv 여러 개를 모두 짝짓는다.
+    어떤 연도에 그 지역 csv가 (하나라도) 없으면 그 연도만 건너뛰고, 쓸 수 있는 연도가 하나도 없으면 지역을 건너뛴다.
+    반환: {실거래 지역명: (xlsx 경로 리스트, [(연도, csv 경로 리스트), ...])}  (연도는 BASIS_DIRS 우선순위 순서)
 """
 def discover_region_files():
     xlsx_by_region = {}
@@ -168,29 +177,44 @@ def discover_region_files():
             continue
         xlsx_by_region.setdefault(region, []).append(path)
 
-    csv_by_region = {}
-    for path in glob.glob(os.path.join(BASIS_DIR, "*.csv")):
-        region = _match_region(os.path.basename(path))
-        if region is None:
-            print(f"건너뜀: 지역명을 알 수 없는 토지특성정보 파일 - {path}")
-            continue
-        if region in csv_by_region:
-            raise ValueError(f"'{region}' 지역의 토지특성정보 파일이 2개 이상 발견됨: {csv_by_region[region]}, {path}")
-        csv_by_region[region] = path
+    # {연도: {csv 지역명: csv 경로}}
+    csv_by_year = {}
+    for year, basis_dir in BASIS_DIRS:
+        csv_by_region = {}
+        for path in glob.glob(os.path.join(basis_dir, "*.csv")):
+            region = _match_region(os.path.basename(path))
+            if region is None:
+                print(f"건너뜀: 지역명을 알 수 없는 토지특성정보 파일 - {path}")
+                continue
+            if region in csv_by_region:
+                raise ValueError(f"{year}년 '{region}' 지역의 토지특성정보 파일이 2개 이상 발견됨: {csv_by_region[region]}, {path}")
+            csv_by_region[region] = path
+        csv_by_year[year] = csv_by_region
 
     # 다른 실거래 지역에 묶여 들어가는 csv 지역(전라남도, 광주광역시)은 단독 지역으로 짝을 찾지 않는다.
     merged_csv_regions = {r for csv_regions in DEAL_REGION_TO_CSV_REGIONS.values() for r in csv_regions}
 
+    all_csv_regions = set().union(*(m.keys() for m in csv_by_year.values()))
     region_files = {}
-    for region in xlsx_by_region.keys() | (csv_by_region.keys() - merged_csv_regions):
+    for region in xlsx_by_region.keys() | (all_csv_regions - merged_csv_regions):
         xlsx_paths = xlsx_by_region.get(region)
-        csv_regions = DEAL_REGION_TO_CSV_REGIONS.get(region, [region])
-        csv_paths = [csv_by_region[r] for r in csv_regions if r in csv_by_region]
-        # 묶어야 하는 csv 중 하나라도 없으면 모집단이 불완전하므로 짝이 없는 것으로 본다.
-        if not xlsx_paths or len(csv_paths) != len(csv_regions):
-            print(f"건너뜀: '{region}' 지역은 xlsx/csv 짝이 없음 (xlsx={xlsx_paths}, csv={csv_paths}, 필요 csv 지역={csv_regions})")
+        if not xlsx_paths:
+            print(f"건너뜀: '{region}' 지역은 실거래가 xlsx가 없음")
             continue
-        region_files[region] = (xlsx_paths, csv_paths)
+        csv_regions = DEAL_REGION_TO_CSV_REGIONS.get(region, [region])
+        csv_list = []
+        for year, _ in BASIS_DIRS:
+            csv_by_region = csv_by_year[year]
+            csv_paths = [csv_by_region[r] for r in csv_regions if r in csv_by_region]
+            # 묶어야 하는 csv 중 하나라도 없으면 그 연도 모집단이 불완전하므로 그 연도는 쓰지 않는다.
+            if len(csv_paths) != len(csv_regions):
+                print(f"경고: '{region}' 지역은 {year}년 csv 짝이 없어 {year}년 매칭은 건너뜀 (csv={csv_paths}, 필요 csv 지역={csv_regions})")
+                continue
+            csv_list.append((year, csv_paths))
+        if not csv_list:
+            print(f"건너뜀: '{region}' 지역은 어느 연도에도 csv 짝이 없음 (xlsx={xlsx_paths}, 필요 csv 지역={csv_regions})")
+            continue
+        region_files[region] = (xlsx_paths, csv_list)
     return region_files
 
 
@@ -242,7 +266,7 @@ def _load_deals(xlsx_path: str):
     csv_paths가 여러 개(전남광주통합특별시 -> 전라남도 + 광주광역시)면 모두 읽어 하나의 후보군(모집단)으로 합친다.
     strip_sido면 법정동명에서 시도를 뗀 비교 키(_dong_compare_key)로 바꿔 둔다. (needed_dongs도 같은 키여야 한다.)
 """
-def _load_candidates_by_dong(region: str, csv_paths: list, needed_dongs: set, strip_sido: bool = False) -> tuple:
+def _load_candidates_by_dong(region: str, csv_paths: list, needed_dongs: set, strip_sido: bool = False, year: str = "") -> tuple:
     candidate_chunks = []
     for csv_path in csv_paths:
         for chunk in pd.read_csv(
@@ -256,6 +280,10 @@ def _load_candidates_by_dong(region: str, csv_paths: list, needed_dongs: set, st
             sub = chunk[chunk["법정동명"].isin(needed_dongs)]
             if len(sub):
                 candidate_chunks.append(sub)
+    # 필요한 법정동이 이 연도 csv에 하나도 없으면 후보가 없다. (빈 리스트를 concat하면 오류)
+    if not candidate_chunks:
+        print(f"[{region}] {year}년 토지 특성정보 후보 건수(대상 법정동 내): 0")
+        return {}, set()
     candidates = pd.concat(candidate_chunks, ignore_index=True)
     candidates = candidates.dropna(subset=["지번"]).copy()
     present_dongs = set(candidates["법정동명"].unique())
@@ -267,7 +295,7 @@ def _load_candidates_by_dong(region: str, csv_paths: list, needed_dongs: set, st
     candidates["공시지가"] = candidates["공시지가"].astype(float)
     candidates["산여부"] = candidates["대장구분명"] == "산"
     candidates["도로조건"] = candidates["도로접면코드"].map(ROAD_SIDE_CODE_TO_CONDITION)
-    print(f"[{region}] 토지 특성정보 후보 건수(대상 법정동 내): {len(candidates)}")
+    print(f"[{region}] {year}년 토지 특성정보 후보 건수(대상 법정동 내): {len(candidates)}")
 
     group_keys = ["법정동명", "산여부"]
     return {key: df for key, df in candidates.groupby(group_keys)}, present_dongs
@@ -276,9 +304,14 @@ def _load_candidates_by_dong(region: str, csv_paths: list, needed_dongs: set, st
     실거래 법정동(최신)이 csv에 없으면 변경 이력을 거꾸로 따라가 csv에 있는 과거 법정동으로 조회한다.
     (PNU/확정번지는 csv에서 찾은 과거 값을 그대로 쓴다.)
     strip_sido면 법정동명을 시도를 뗀 비교 키(_dong_compare_key)로 비교한다. (전남광주통합특별시)
+
+    연도별 보완 매칭: deals에서 아직 PNU가 없는(앞 연도까지 매칭 안 된) 행만 이 연도 후보로 매칭하고,
+    성공한 행에만 PNU/확정번지/토지면적/공시지가/매칭연도(year)를 채운다. (이미 매칭된 행은 건드리지 않는다.)
+    반환: (이번 연도 신규 매칭 건수, 그중 과거 법정동 회귀 매칭 건수)
 """
-def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actual_target_count: int, cancelled_count: int, small_area_count: int, share_count: int, candidates_by_group: dict, present_dongs: set, reverse_map: dict, strip_sido: bool = False) -> dict:
-    land_total_count = actual_target_count - share_count  # 특정토지 전체 거래 건수
+def _match_deals(deals, candidates_by_group: dict, present_dongs: set, reverse_map: dict, strip_sido: bool, year: str) -> tuple:
+    # 앞 연도까지 매칭 안 된 행만 대상으로 한다.
+    unmatched = deals[deals["PNU"].isna()]
 
     # 실거래 법정동 -> 이 csv에서 조회할 법정동 (같은 법정동이 반복되므로 캐시)
     lookup_dong_cache = {}
@@ -332,7 +365,7 @@ def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actua
     matched_beonji = []
     matched_area = []
     matched_official_price = []
-    for row in deals.itertuples(index=False):
+    for row in unmatched.itertuples(index=False):
         # 0. 번지가 비어있는(NaN) 행은 매칭 불가능하므로 바로 실패 처리한다.
         #    (예: 경상북도 데이터의 포항시 북구 흥해읍 곡강리 건처럼 원본에 번지 누락이 있는 경우)
         if pd.isna(row.번지):
@@ -414,82 +447,117 @@ def _match_and_write(region: str, xlsx_path: str, deals, total_count: int, actua
             matched_area.append(None)
             matched_official_price.append(None)
 
-    deals["PNU"] = matched_pnu
-    deals["확정번지"] = matched_beonji
-    deals["토지면적"] = matched_area
-    deals["공시지가"] = matched_official_price
+    # 이번 연도에 성공한 행에만 값을 채운다. (matched_* 리스트는 unmatched 행 순서와 같다)
+    success_pos = [i for i, pnu in enumerate(matched_pnu) if pnu is not None]
+    success_idx = unmatched.index[success_pos]
+    deals.loc[success_idx, "PNU"] = [matched_pnu[i] for i in success_pos]
+    deals.loc[success_idx, "확정번지"] = [matched_beonji[i] for i in success_pos]
+    deals.loc[success_idx, "토지면적"] = [matched_area[i] for i in success_pos]
+    deals.loc[success_idx, "공시지가"] = [matched_official_price[i] for i in success_pos]
+    deals.loc[success_idx, "매칭연도"] = year
 
-    success_count = deals["PNU"].notna().sum()
     # matched_lookup_dong: 매칭 성공 행에서 실제로 토지특성정보를 조회한 법정동명(과거 법정동으로 회귀했다면 과거 이름)
     # 엑셀 컬럼으로는 남기지 않고, 회귀 매칭 건수 집계에만 사용한다.
     # 공백 차이만 있는 경우를 회귀로 세지 않도록 시군구도 정규화해서 비교한다.
     regressed_count = sum(
-        1 for lookup, raw_dong in zip(matched_lookup_dong, deals["시군구"])
+        1 for lookup, raw_dong in zip(matched_lookup_dong, unmatched["시군구"])
         if lookup is not None and lookup != _dong_compare_key(raw_dong, strip_sido)
     )
+    return len(success_pos), regressed_count
+
+"""모든 연도 매칭이 끝난 최종 deals로 통계 수치를 계산한다."""
+def _compute_stats(region: str, xlsx_path: str, deals, total_count: int, actual_target_count: int, cancelled_count: int, small_area_count: int, share_count: int) -> dict:
+    land_total_count = actual_target_count - share_count  # 특정토지 전체 거래 건수
+
+    success_count = deals["PNU"].notna().sum()
     share_deal_mask = deals["지분구분"] == "지분"
     share_success_count = (share_deal_mask & deals["PNU"].notna()).sum()  # 지분거래 매칭 성공 건수
     land_success_count = (~share_deal_mask & deals["PNU"].notna()).sum()
-    print(f"[{region}] {os.path.basename(xlsx_path)} 매칭 성공 건수: {success_count} / {actual_target_count} (그중 과거 법정동 회귀 매칭 {regressed_count}건)")
-    print(f"[{region}] {os.path.basename(xlsx_path)} 지분거래 매칭 성공 건수: {share_success_count} / {share_count}")
-    print(f"[{region}] {os.path.basename(xlsx_path)} 특정토지 전체 거래 매칭 성공 건수: {land_success_count} / {land_total_count}")
+    # 연도별 매칭 기여 건수 (BASIS_DIRS 우선순위 순서)
+    year_counts = {year: int((deals["매칭연도"] == year).sum()) for year, _ in BASIS_DIRS}
 
-    _xlsx_name, _xlsx_ext = os.path.splitext(os.path.basename(xlsx_path))
+    return {
+        "region": region,
+        "file": os.path.basename(xlsx_path),
+        "total_count": total_count,
+        "actual_target_count": actual_target_count,
+        "cancelled": cancelled_count,
+        "small_area": small_area_count,
+        "share_count": share_count,
+        "land_total_count": land_total_count,
+        "success": success_count,
+        "share_success": share_success_count,
+        "land_success": land_success_count,
+        "overall_success_rate": success_count / actual_target_count if actual_target_count else 0,
+        "share_ratio": share_count / actual_target_count if actual_target_count else 0,
+        "land_success_rate": land_success_count / land_total_count if land_total_count else 0,
+        "share_success_rate": share_success_count / share_count if share_count else 0,
+        "year_counts": year_counts,
+    }
+
+"""연도 라벨: 첫 우선순위 연도는 "n년 매칭", 이후 연도는 "n년 보완 매칭"."""
+def _year_label(year: str) -> str:
+    return f"{year}년 매칭" if year == BASIS_DIRS[0][0] else f"{year}년 보완 매칭"
+
+"""최종 매핑 결과 deals와 통계를 xlsx로 저장하고 출력 경로를 반환한다.
+
+    상단 1~4행은 기존 통계, 5행은 연도별 매칭 건수. 표는 DATA_START_ROW(6행)부터 쓴다.
+"""
+def _write_output(deals, stats: dict) -> str:
+    region = stats["region"]
+    file_name = stats["file"]
+    print(f"[{region}] {file_name} 매칭 성공 건수: {stats['success']} / {stats['actual_target_count']}")
+    print(f"[{region}] {file_name} 지분거래 매칭 성공 건수: {stats['share_success']} / {stats['share_count']}")
+    print(f"[{region}] {file_name} 특정토지 전체 거래 매칭 성공 건수: {stats['land_success']} / {stats['land_total_count']}")
+    print(f"[{region}] {file_name} 연도별 매칭: " + ", ".join(f"{_year_label(y)} {n}건" for y, n in stats["year_counts"].items()))
+
+    _xlsx_name, _xlsx_ext = os.path.splitext(file_name)
     output_path = os.path.join(OUTPUT_DIR, f"{_xlsx_name}_매핑{_xlsx_ext}")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         deals.to_excel(writer, sheet_name="실거래가", index=False, startrow=DATA_START_ROW)
         sheet = writer.sheets["실거래가"]
         sheet["A1"] = f"total_info"
-        sheet["B1"] = f"전체 건수: {total_count}"
-        sheet["G1"] = f"실제 처리대상 건수: {actual_target_count}"
-        sheet["L1"] = f"매칭 성공 건수: {success_count}"
-        overall_success_rate = success_count / actual_target_count if actual_target_count else 0
-        sheet["Q1"] = f"매칭 성공률: {overall_success_rate:.1%}"
+        sheet["B1"] = f"전체 건수: {stats['total_count']}"
+        sheet["G1"] = f"실제 처리대상 건수: {stats['actual_target_count']}"
+        sheet["L1"] = f"매칭 성공 건수: {stats['success']}"
+        sheet["Q1"] = f"매칭 성공률: {stats['overall_success_rate']:.1%}"
 
         sheet["A2"] = f"제외 case"
-        sheet["B2"] = f"거래취소로 제외된 건수: {cancelled_count}"
-        sheet["G2"] = f"면적30이하로 제외된 건수 :  {small_area_count}"
+        sheet["B2"] = f"거래취소로 제외된 건수: {stats['cancelled']}"
+        sheet["G2"] = f"면적30이하로 제외된 건수 :  {stats['small_area']}"
 
         sheet["A3"] = f"지분거래"
-        sheet["B3"] = f"지분 거래 건수: {share_count}"
-        share_ratio = share_count / actual_target_count if actual_target_count else 0
-        sheet["G3"] = f"지분거래 비율: {share_ratio:.1%}"
-        sheet["L3"] = f"지분거래 매칭 성공 건수: {share_success_count}"
-        share_success_rate = share_success_count / share_count if share_count else 0
-        sheet["Q3"] = f"지분거래 성공률: {share_success_rate:.1%}"
-        
+        sheet["B3"] = f"지분 거래 건수: {stats['share_count']}"
+        sheet["G3"] = f"지분거래 비율: {stats['share_ratio']:.1%}"
+        sheet["L3"] = f"지분거래 매칭 성공 건수: {stats['share_success']}"
+        sheet["Q3"] = f"지분거래 성공률: {stats['share_success_rate']:.1%}"
+
         sheet["A4"] = f"전체거래"
-        sheet["B4"] = f"특정토지 전체거래 건수: {land_total_count}"
-        sheet["L4"] = f"특정토지 전체거래 매칭 성공 건수: {land_success_count}"
-        land_success_rate = land_success_count / land_total_count if land_total_count else 0    
-        sheet["Q4"] = f"전체거래 성공률: {land_success_rate:.1%}"
-        
+        sheet["B4"] = f"특정토지 전체거래 건수: {stats['land_total_count']}"
+        sheet["L4"] = f"특정토지 전체거래 매칭 성공 건수: {stats['land_success']}"
+        sheet["Q4"] = f"전체거래 성공률: {stats['land_success_rate']:.1%}"
+
+        sheet["A5"] = f"연도별 매칭"
+        for col, (year, count) in zip(["B5", "G5", "L5", "Q5"], stats["year_counts"].items()):
+            sheet[col] = f"{_year_label(year)} 건수: {count}"
+
     print(f"[{region}] 완료: {output_path}")
+    return output_path
 
-    return {
-        "region": region,
-        "file": os.path.basename(xlsx_path),
-        "actual_target_count": actual_target_count,
-        "cancelled": cancelled_count,
-        "success": success_count,
-        "share_ratio": share_ratio,
-        "land_success_rate": land_success_rate,
-        "share_success_rate": share_success_rate,
-        "output": output_path,
-    }
+"""같은 지역의 xlsx 여러 개가 연도별 csv를 공유하므로, csv는 연도마다 한 번만 읽고 xlsx만 반복 처리한다.
+    (전남광주통합특별시는 연도마다 전라남도/광주광역시 csv 2개가 들어오며, 둘을 합친 후보군을 공유한다.)
 
-"""같은 지역의 xlsx 여러 개가 csv 1개를 공유하므로, csv는 지역당 한 번만 읽고 xlsx만 반복 처리한다.
-    (전남광주통합특별시는 csv_paths에 전라남도/광주광역시 csv 2개가 들어오며, 둘을 합친 후보군을 공유한다.)
-
+    1차: 우선순위 첫 연도(26) csv로 전체 행 매칭 -> 메모리 해제
+    2차~: 앞 연도까지 매칭 안 된 행만으로 needed_dongs를 다시 만들어 다음 연도(25 -> 24 -> 23) csv를 읽어 재매칭 -> 메모리 해제
+    모든 연도 매칭이 끝난 뒤 최종 결과로 통계를 산출하고 결과를 쓴다.
     실거래 법정동이 csv에 없으면 reverse_map(법정동 변경 이력)으로 과거 법정동에 회귀해 조회하므로,
     csv에서 걸러 둘 법정동(needed_dongs)에 과거 법정동명도 함께 넣는다.
 """
-def process_region_group(region: str, xlsx_paths, csv_paths: list, reverse_map: dict) -> list:
+def process_region_group(region: str, xlsx_paths, csv_list: list, reverse_map: dict) -> list:
     # 전남광주통합특별시는 실거래/토지특성 시도명이 달라 시도를 떼고 법정동명을 비교한다.
     strip_sido = region in SIDO_STRIP_REGIONS
     loaded = []
-    needed_dongs = set()
     for xlsx_path in xlsx_paths:
         try:
             deals, total_count, actual_target_count, cancelled_count, small_area_count, share_count = _load_deals(xlsx_path)
@@ -500,21 +568,42 @@ def process_region_group(region: str, xlsx_paths, csv_paths: list, reverse_map: 
         print(f"[{region}] {os.path.basename(xlsx_path)} 해제사유발생일 있어 제외된 건수: {cancelled_count}")
         print(f"[{region}] {os.path.basename(xlsx_path)} 계약면적 30이하로 제외된 건수: {small_area_count}")
         print(f"[{region}] {os.path.basename(xlsx_path)} 지분 거래 건수: {share_count}")
-        for raw_dong in deals["시군구"].dropna().unique():
-            # csv 법정동명과 같은 기준으로 비교하도록 정규화한 이름으로 키를 만든다.
-            # (변경 이력은 시도 포함 전체 이름으로 따라간 뒤, 각 이름을 비교 키로 바꿔 넣는다.)
-            dong = _normalize_dong_name(raw_dong)
-            for name in [dong] + _ancestors(dong, reverse_map):
-                needed_dongs.add(_dong_compare_key(name, strip_sido))
+        # 매칭 결과 컬럼. 연도별 매칭에서 성공한 행만 채워 나가므로 빈 값으로 시작한다.
+        for col in ["PNU", "확정번지", "토지면적", "공시지가", "매칭연도"]:
+            deals[col] = None
         loaded.append((xlsx_path, deals, total_count, actual_target_count, cancelled_count, small_area_count, share_count))
 
     if not loaded:
         return []
 
-    # 실거래가에 등장하는 시군구(법정동명)만 후보로 남기면 되므로, CSV 전체를 메모리에 올리지 않고
-    # 청크 단위로 읽으면서 법정동명이 일치하는 행만 추려낸다. 이 지역의 xlsx 전체에서 필요한 동을
-    # 먼저 모아뒀기 때문에 CSV는 이 한 번만 읽으면 된다.
-    candidates_by_group, present_dongs = _load_candidates_by_dong(region, csv_paths, needed_dongs, strip_sido)
+    # 연도 우선순위대로 csv를 한 연도씩만 메모리에 올려 매칭한다.
+    for year, csv_paths in csv_list:
+        # 실거래가에 등장하는 시군구(법정동명)만 후보로 남기면 되므로, CSV 전체를 메모리에 올리지 않고
+        # 청크 단위로 읽으면서 법정동명이 일치하는 행만 추려낸다. 이 지역의 xlsx 전체에서 필요한 동을
+        # 먼저 모아뒀기 때문에 CSV는 연도마다 이 한 번만 읽으면 된다.
+        # 필요한 동은 매 연도마다 "아직 매칭 안 된 행"으로 다시 만들기 때문에, 뒤 연도일수록 읽어 둘 후보가 줄어든다.
+        needed_dongs = set()
+        for _, deals, *_ in loaded:
+            for raw_dong in deals.loc[deals["PNU"].isna(), "시군구"].dropna().unique():
+                # csv 법정동명과 같은 기준으로 비교하도록 정규화한 이름으로 키를 만든다.
+                # (변경 이력은 시도 포함 전체 이름으로 따라간 뒤, 각 이름을 비교 키로 바꿔 넣는다.)
+                dong = _normalize_dong_name(raw_dong)
+                for name in [dong] + _ancestors(dong, reverse_map):
+                    needed_dongs.add(_dong_compare_key(name, strip_sido))
+        if not needed_dongs:
+            print(f"[{region}] 남은 미매칭 행이 없어 {year}년 이후 매칭은 생략")
+            break
+
+        candidates_by_group, present_dongs = _load_candidates_by_dong(region, csv_paths, needed_dongs, strip_sido, year)
+        for xlsx_path, deals, *_ in loaded:
+            try:
+                newly_matched, regressed = _match_deals(deals, candidates_by_group, present_dongs, reverse_map, strip_sido, year)
+                print(f"[{region}] {os.path.basename(xlsx_path)} {_year_label(year)}: {newly_matched}건 (그중 과거 법정동 회귀 매칭 {regressed}건)")
+            except Exception as e:
+                print(f"[{region}] {xlsx_path} {year}년 매칭 처리 실패: {e}")
+        # 이 연도의 CSV 후보(candidates_by_group)는 다음 연도 처리 전에 해제한다.
+        del candidates_by_group, present_dongs
+        gc.collect()
 
     summaries = []
     # loaded에서 하나씩 꺼내 처리 즉시 참조를 없애, 처리 끝난 xlsx의 데이터가 다음 xlsx 처리 중에도
@@ -522,16 +611,15 @@ def process_region_group(region: str, xlsx_paths, csv_paths: list, reverse_map: 
     while loaded:
         xlsx_path, deals, total_count, actual_target_count, cancelled_count, small_area_count, share_count = loaded.pop(0)
         try:
-            summaries.append(_match_and_write(region, xlsx_path, deals, total_count, actual_target_count, cancelled_count, small_area_count, share_count, candidates_by_group, present_dongs, reverse_map, strip_sido))
+            stats = _compute_stats(region, xlsx_path, deals, total_count, actual_target_count, cancelled_count, small_area_count, share_count)
+            stats["output"] = _write_output(deals, stats)
+            summaries.append(stats)
         except Exception as e:
-            print(f"[{region}] {xlsx_path} 매칭 처리 실패로 건너뜀: {e}")
+            print(f"[{region}] {xlsx_path} 결과 저장 실패로 건너뜀: {e}")
         finally:
             del deals
             gc.collect()
 
-    # 이 지역의 CSV 후보(candidates_by_group)는 다음 지역 처리 전에 해제한다.
-    del candidates_by_group, present_dongs
-    gc.collect()
     return summaries
 
 
@@ -546,9 +634,10 @@ def main():
 
     # 실질적인 처리및 매핑로직은 메서드 process_region_group에 다 들어있음
     summaries = []
-    for region, (xlsx_paths, csv_paths) in region_files.items():
+    for region, (xlsx_paths, csv_list) in region_files.items():
+        print(f"\n=== [{region}] xlsx {len(xlsx_paths)}개, csv 연도: {[year for year, _ in csv_list]} ===")
         try:
-            summaries.extend(process_region_group(region, xlsx_paths, csv_paths, reverse_map))
+            summaries.extend(process_region_group(region, xlsx_paths, csv_list, reverse_map))
         except Exception as e:
             print(f"[{region}] 처리 중 오류로 건너뜀: {e}")
 
@@ -560,6 +649,7 @@ def main():
 
     # 원본 파일명별 핵심 통계(실제 처리대상 건수, 지분거래 비율, 전체거래 성공률, 지분거래 성공률)를
     # 개별 매핑 xlsx를 일일이 열어보지 않고 한눈에 비교할 수 있도록 별도 요약 xlsx로 모아둔다.
+    # 모든 연도 보완 매칭이 끝난 최종 결과 기준이며, 연도별 매칭 건수도 함께 남긴다.
     summary_rows = [
         {
             "원본파일명": s["file"],
@@ -567,6 +657,7 @@ def main():
             "지분거래 비율": f"{s['share_ratio']:.1%}",
             "전체거래 성공률": f"{s['land_success_rate']:.1%}",
             "지분거래 성공률": f"{s['share_success_rate']:.1%}",
+            **{f"{_year_label(year)} 건수": s["year_counts"].get(year, 0) for year, _ in BASIS_DIRS},
         }
         for s in summaries
     ]
@@ -579,6 +670,7 @@ def main():
             "지분거래 비율": f"{avg_share_ratio:.1%}",
             "전체거래 성공률": f"{avg_land_success_rate:.1%}",
             "지분거래 성공률": "",
+            **{f"{_year_label(year)} 건수": "" for year, _ in BASIS_DIRS},
         })
 
         os.makedirs(OUTPUT_DIR, exist_ok=True)
