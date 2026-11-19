@@ -219,7 +219,8 @@ def discover_region_files():
 
 
 def _load_deals(xlsx_path: str):
-    deals = pd.read_excel(xlsx_path, header=HEADER_ROW)
+    # calamine 엔진(Rust 기반)은 기본 openpyxl보다 xlsx 읽기가 훨씬 빠르다. (python-calamine 패키지 필요)
+    deals = pd.read_excel(xlsx_path, header=HEADER_ROW, engine="calamine")
     total_count = len(deals)
 
     # 계약면적 30 이하인 소규모 거래는 분석 대상에서 제외한다.
@@ -514,33 +515,35 @@ def _write_output(deals, stats: dict) -> str:
     _xlsx_name, _xlsx_ext = os.path.splitext(file_name)
     output_path = os.path.join(OUTPUT_DIR, f"{_xlsx_name}_매핑{_xlsx_ext}")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    # xlsxwriter 엔진은 openpyxl보다 쓰기가 빠르다. (xlsxwriter 패키지 필요)
+    # xlsxwriter는 sheet["A1"] = 값 대입을 지원하지 않으므로 sheet.write("A1", 값)으로 셀을 쓴다.
+    with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
         deals.to_excel(writer, sheet_name="실거래가", index=False, startrow=DATA_START_ROW)
         sheet = writer.sheets["실거래가"]
-        sheet["A1"] = f"total_info"
-        sheet["B1"] = f"전체 건수: {stats['total_count']}"
-        sheet["G1"] = f"실제 처리대상 건수: {stats['actual_target_count']}"
-        sheet["L1"] = f"매칭 성공 건수: {stats['success']}"
-        sheet["Q1"] = f"매칭 성공률: {stats['overall_success_rate']:.1%}"
+        sheet.write("A1", f"total_info")
+        sheet.write("B1", f"전체 건수: {stats['total_count']}")
+        sheet.write("G1", f"실제 처리대상 건수: {stats['actual_target_count']}")
+        sheet.write("L1", f"매칭 성공 건수: {stats['success']}")
+        sheet.write("Q1", f"매칭 성공률: {stats['overall_success_rate']:.1%}")
 
-        sheet["A2"] = f"제외 case"
-        sheet["B2"] = f"거래취소로 제외된 건수: {stats['cancelled']}"
-        sheet["G2"] = f"면적30이하로 제외된 건수 :  {stats['small_area']}"
+        sheet.write("A2", f"제외 case")
+        sheet.write("B2", f"거래취소로 제외된 건수: {stats['cancelled']}")
+        sheet.write("G2", f"면적30이하로 제외된 건수 :  {stats['small_area']}")
 
-        sheet["A3"] = f"지분거래"
-        sheet["B3"] = f"지분 거래 건수: {stats['share_count']}"
-        sheet["G3"] = f"지분거래 비율: {stats['share_ratio']:.1%}"
-        sheet["L3"] = f"지분거래 매칭 성공 건수: {stats['share_success']}"
-        sheet["Q3"] = f"지분거래 성공률: {stats['share_success_rate']:.1%}"
+        sheet.write("A3", f"지분거래")
+        sheet.write("B3", f"지분 거래 건수: {stats['share_count']}")
+        sheet.write("G3", f"지분거래 비율: {stats['share_ratio']:.1%}")
+        sheet.write("L3", f"지분거래 매칭 성공 건수: {stats['share_success']}")
+        sheet.write("Q3", f"지분거래 성공률: {stats['share_success_rate']:.1%}")
 
-        sheet["A4"] = f"전체거래"
-        sheet["B4"] = f"특정토지 전체거래 건수: {stats['land_total_count']}"
-        sheet["L4"] = f"특정토지 전체거래 매칭 성공 건수: {stats['land_success']}"
-        sheet["Q4"] = f"전체거래 성공률: {stats['land_success_rate']:.1%}"
+        sheet.write("A4", f"전체거래")
+        sheet.write("B4", f"특정토지 전체거래 건수: {stats['land_total_count']}")
+        sheet.write("L4", f"특정토지 전체거래 매칭 성공 건수: {stats['land_success']}")
+        sheet.write("Q4", f"전체거래 성공률: {stats['land_success_rate']:.1%}")
 
-        sheet["A5"] = f"연도별 매칭"
+        sheet.write("A5", f"연도별 매칭")
         for col, (year, count) in zip(["B5", "G5", "L5", "Q5"], stats["year_counts"].items()):
-            sheet[col] = f"{_year_label(year)} 건수: {count}"
+            sheet.write(col, f"{_year_label(year)} 건수: {count}")
 
     print(f"[{region}] 완료: {output_path}")
     return output_path
