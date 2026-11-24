@@ -2,6 +2,7 @@
 # data/raw 의 모든 실거래가 xlsx를 전국 대상으로 한번에 처리한다.
 # 매칭된 건물의 대장pk는 각 실거래 xlsx에 컬럼 하나로 붙이고, 건물 상세 정보는 대장pk 기준으로
 # 중복 없이 모아 data/processed/건물정보.xlsx 마스터 테이블 하나로 별도 저장한다.
+# 현재 표제부로 매칭되지 않은 행은 폐쇄말소 표제부(거래 후 멸실된 건물 등)로 한 번 더 보완 매칭한다.
 import glob
 import os
 import re
@@ -21,6 +22,13 @@ INPUT_DIR = r"D:\dev\data\processed\traded_house_processed\overall"  # 이 디�
 # 청크 단위로 읽으며 '일반' 대장구분 + 필요한 동만 추려낸다.
 BASIS_CSV = r"D:\dev\data\basis\building_ledger\표제부_2026_09.csv"
 BASIS_CSV_ENCODING = "utf-8-sig"  # CSV가 BOM 포함 UTF-8이라, BOM이 첫 컬럼명에 붙지 않도록 utf-8-sig로 읽는다.
+# 폐쇄말소 표제부 CSV. 현재 표제부로 매칭 실패한 행만 이걸로 보완 매칭한다.
+# (과거 거래일수록 거래 후 철거(멸실)돼 현재 표제부에서 빠진 건물이 많아, 이 경로로 상당수가 매칭된다.)
+CLOSED_BASIS_CSV = r"D:\dev\data\basis\building_ledger\closed\폐쇄말소_표제부_2026_09.csv"
+# 매칭출처 컬럼 값: 어떤 대장에서 확정번지를 찾았는지 구분한다.
+SOURCE_OVERALL = "총괄표제부"  # find_overall_ledger_house.py 단계에서 이미 확정번지를 찾은 행
+SOURCE_CURRENT = "표제부"
+SOURCE_CLOSED = "폐쇄말소"
 OUTPUT_DIR = r"D:\dev\data\processed\traded_house_processed"
 SUMMARY_FILE_NAME = "표제부매핑_단독다가구_요약통계.xlsx"  # 파일별 매칭 통계를 모아 OUTPUT_DIR에 저장한다.
 SUMMARY_SHEET_NAME = "요약통계"
@@ -85,7 +93,13 @@ BASIS_CSV_COLUMN_RENAME = {
 }
 # 매칭(대장구분/대지위치/번/지/사용승인일)에 필요한 컬럼 + 붙임 컬럼만 읽어 CSV 파싱 비용을 줄인다.
 # 대지구분은 '총괄표제 존재여부'가 O인 지번주소의 표제부 상세 조회에서 산 지번을 구분하는 데 쓴다.
-BASIS_USECOLS = list(BASIS_CSV_COLUMN_RENAME.keys())
+# (읽을 컬럼은 각 CSV의 rename 매핑 키로 정하므로 _load_basis_candidates에서 rename 매핑으로부터 만든다.)
+# 폐쇄말소 표제부 CSV는 PK 컬럼명만 다르고 나머지 헤더는 표제부와 같다. 폐쇄말소일은 건물정보.xlsx에 함께 남긴다.
+CLOSED_BASIS_CSV_COLUMN_RENAME = {
+    **{k: v for k, v in BASIS_CSV_COLUMN_RENAME.items() if k != "관리_건축물대장_PK"},
+    "관리_폐쇄말소대장_PK": "PK",
+    "폐쇄말소_일": "폐쇄말소일",
+}
 # 건축물대장 대지_구분_코드 중 산 지번을 뜻하는 값(0: 대지, 1: 산, 2: 블록).
 SAN_DAEJI_GUBUN_CODE = "1"
 # "서울특별시 성북구 돈암동 552-3번지" / "...산11-1번지" 형태의 대지위치 끝에서 번지 부분을 떼어내기 위한 패턴.
@@ -151,18 +165,20 @@ def parse_daeji_wichi(raw):
 """전국 건축물대장 CSV를 청크 단위로 읽어, '일반' 대장구분만 남기고 시군구(대지위치에서 번지를 뗀 "시도 구 법정동" 문자열) 별로 묶은 후보 딕셔너리를 만든다.
 
     전국 xlsx를 모두 처리하므로 동 단위 필터링 없이 전체를 대상으로 한다.
+    column_rename은 CSV 헤더 -> 내부 컬럼명 매핑으로, 읽을 컬럼(usecols)도 이 매핑의 키로 정한다.
+    (현재 표제부는 BASIS_CSV_COLUMN_RENAME, 폐쇄말소 표제부는 CLOSED_BASIS_CSV_COLUMN_RENAME)
 """
-def _load_basis_candidates(basis_csv_path: str) -> dict:
+def _load_basis_candidates(basis_csv_path: str, column_rename: dict) -> dict:
     if not os.path.exists(basis_csv_path):
         raise FileNotFoundError(f"{basis_csv_path} 가 없습니다.")
 
     print(f"{os.path.basename(basis_csv_path)} 로딩 중...")
     chunks = []
     reader = pd.read_csv(
-        basis_csv_path, encoding=BASIS_CSV_ENCODING, dtype=str, usecols=BASIS_USECOLS, chunksize=CSV_CHUNK_SIZE
+        basis_csv_path, encoding=BASIS_CSV_ENCODING, dtype=str, usecols=list(column_rename.keys()), chunksize=CSV_CHUNK_SIZE
     )
     for chunk in reader:
-        chunk = chunk.rename(columns=BASIS_CSV_COLUMN_RENAME)
+        chunk = chunk.rename(columns=column_rename)
         chunk = chunk[chunk["대장구분"] == "일반"]
         if chunk.empty:
             continue
@@ -233,7 +249,8 @@ def _match_deal(deal: dict, candidates_by_dong: dict):
     산여부 = str(deal["번지"]).startswith("산")
     지번주소 = deal["시군구"] + (" 산 " if 산여부 else " ") + beonji
     extra = {BASIS_EXTRA_COLUMN_RENAME.get(col, col): matched[col] for col in BASIS_EXTRA_COLUMNS}
-    return {"확정번지": beonji, "지번주소": 지번주소, **extra}
+    # 폐쇄말소 표제부에서 찾은 경우에만 폐쇄말소일이 있다(현재 표제부면 None).
+    return {"확정번지": beonji, "지번주소": 지번주소, "폐쇄말소일": matched.get("폐쇄말소일"), **extra}
 
 
 """전체 실거래 행 중 '총괄표제 존재여부'가 비어있는(확정번지가 아직 없는) 행은 _match_deal로 확정번지와
@@ -246,27 +263,45 @@ def _match_deal(deal: dict, candidates_by_dong: dict):
     대장pk 문자열 캐시로, main()에서 파일 간에 재사용되어 같은 건물을 여러 번 표제부 조회하지 않게 한다.
     통계를 계산해 결과 xlsx로 저장한다.
 
-    요약 통계 파일 작성을 위해 (확정번지 있는 건수, 대장pk가 채워진(표제부에 건물정보 있는) 건수)를 반환한다."""
+    현재 표제부(candidates_by_dong)로 매칭 실패한 행은 폐쇄말소 표제부(closed_candidates_by_dong)로 다시 매칭한다.
+    어느 대장에서 찾았는지는 '매칭출처' 컬럼(총괄표제부/표제부/폐쇄말소)에 남긴다.
+    buildings_by_pk의 키는 (대장출처, 대장pk)다. 현재 표제부와 폐쇄말소 표제부의 PK는 서로 다른 체계라 출처를 함께 키로 쓴다.
+
+    요약 통계 파일 작성을 위해 (확정번지 있는 건수, 대장pk가 채워진(표제부에 건물정보 있는) 건수, 폐쇄말소 매칭 건수)를 반환한다."""
 def _match_and_write(
-    xlsx_path: str, deals, total_count: int, candidates_by_dong: dict, address_pk_cache: dict, buildings_by_pk: dict
+    xlsx_path: str, deals, total_count: int, candidates_by_dong: dict, closed_candidates_by_dong: dict,
+    address_pk_cache: dict, buildings_by_pk: dict
 ):
     needs_match_mask = deals["확정번지"].isna()
     needs_match_index = deals.index[needs_match_mask]
-    match_results = [_match_deal(deal, candidates_by_dong) for deal in deals.loc[needs_match_mask].to_dict("records")]
+    needs_match_records = deals.loc[needs_match_mask].to_dict("records")
+    match_results = [_match_deal(deal, candidates_by_dong) for deal in needs_match_records]
+    # 현재 표제부로 못 찾은 행만 폐쇄말소 표제부로 보완 매칭한다. (이미 찾은 행은 건드리지 않는다.)
+    closed_results = [
+        _match_deal(deal, closed_candidates_by_dong) if result is None else None
+        for deal, result in zip(needs_match_records, match_results)
+    ]
 
-    found_index = [idx for idx, result in zip(needs_match_index, match_results) if result is not None]
-    found_results = [result for result in match_results if result is not None]
+    # (행 index, 매칭 결과, 매칭출처) 목록
+    found = [(idx, result, SOURCE_CURRENT) for idx, result in zip(needs_match_index, match_results) if result is not None]
+    found += [(idx, result, SOURCE_CLOSED) for idx, result in zip(needs_match_index, closed_results) if result is not None]
+    found_index = [idx for idx, _, _ in found]
 
     if "대장pk" not in deals.columns:
         deals["대장pk"] = pd.NA
+    # 총괄표제부 단계에서 이미 확정번지를 찾은 행은 출처를 총괄표제부로 둔다.
+    deals["매칭출처"] = deals["총괄표제 존재여부"].map({"O": SOURCE_OVERALL})
     if found_index:
-        deals.loc[found_index, "확정번지"] = [result["확정번지"] for result in found_results]
-        deals.loc[found_index, "대장pk"] = [result["대장pk"] for result in found_results]
+        deals.loc[found_index, "확정번지"] = [result["확정번지"] for _, result, _ in found]
+        deals.loc[found_index, "대장pk"] = [result["대장pk"] for _, result, _ in found]
+        deals.loc[found_index, "매칭출처"] = [source for _, _, source in found]
 
-    # 마스킹 번지 경로(_match_deal)에서 매칭된 건물 상세를 대장pk 기준으로 누적(건물정보.xlsx용).
-    for result in found_results:
-        buildings_by_pk[result["대장pk"]] = {
+    # 마스킹 번지 경로(_match_deal)에서 매칭된 건물 상세를 (대장출처, 대장pk) 기준으로 누적(건물정보.xlsx용).
+    for _, result, source in found:
+        buildings_by_pk[(source, result["대장pk"])] = {
             "지번주소": result["지번주소"],
+            "대장출처": source,
+            "폐쇄말소일": result["폐쇄말소일"],
             **{col: result[col] for col in OUTPUT_EXTRA_COLUMNS},
         }
 
@@ -274,12 +309,14 @@ def _match_and_write(
 
     deals = deals.drop(columns=["_시군구", "_번지_접두어", "_번지_자리수"])
 
+    current_success_count = sum(1 for _, _, source in found if source == SOURCE_CURRENT)
+    closed_success_count = sum(1 for _, _, source in found if source == SOURCE_CLOSED)
     new_success_count = len(found_index)
     success_count = deals["확정번지"].notna().sum()
     success_rate = success_count / total_count if total_count else 0
     pk_filled_count = deals["대장pk"].notna().sum()
     print(f"{os.path.basename(xlsx_path)} 전체 건수: {total_count}")
-    print(f"{os.path.basename(xlsx_path)} 신규 매칭 성공 건수(총괄표제 미존재 대상): {new_success_count} / {needs_match_mask.sum()}")
+    print(f"{os.path.basename(xlsx_path)} 신규 매칭 성공 건수(총괄표제 미존재 대상): {new_success_count} / {needs_match_mask.sum()} (표제부 {current_success_count} + 폐쇄말소 {closed_success_count})")
     print(f"{os.path.basename(xlsx_path)} 매칭 성공 건수(확정번지): {success_count}")
     print(f"{os.path.basename(xlsx_path)} 매칭 성공률: {success_rate:.1%}")
     print(f"{os.path.basename(xlsx_path)} 대장pk 채워진 건수: {pk_filled_count} (신규 매칭 {new_success_count} + 총괄표제 O-case {o_case_pk_count})")
@@ -295,9 +332,10 @@ def _match_and_write(
         sheet["G1"] = f"매칭 성공 건수(확정번지): {success_count}"
         sheet["L1"] = f"매칭 성공률: {success_rate:.1%}"
         sheet["Q1"] = f"대장pk 채워진 건수: {pk_filled_count}"
+        sheet["V1"] = f"폐쇄말소 매칭 건수: {closed_success_count}"
 
     print(f"완료: {output_path}")
-    return int(success_count), int(pk_filled_count)
+    return int(success_count), int(pk_filled_count), closed_success_count
 
 
 """'총괄표제 존재여부'가 'O'인 행(이미 총괄표제부로 확정번지를 찾은 행)에 대해 지번주소를 만들고,
@@ -341,7 +379,7 @@ def _fill_o_case_pk(deals, candidates_by_dong: dict, address_pk_cache: dict, bui
             address_pk_cache[addr_key] = None
             continue
         for basis_row in basis_rows:
-            buildings_by_pk[basis_row["대장pk"]] = {"지번주소": addr_key, **basis_row}
+            buildings_by_pk[(SOURCE_CURRENT, basis_row["대장pk"])] = {"지번주소": addr_key, "대장출처": SOURCE_CURRENT, **basis_row}
         address_pk_cache[addr_key] = ",".join(str(basis_row["대장pk"]) for basis_row in basis_rows)
 
     pk_series = o_case["지번주소"].map(address_pk_cache)
@@ -380,9 +418,10 @@ def _match_address_basis_rows(address: dict, candidates_by_dong: dict) -> list:
     나온 건물이 섞여 들어오며, 동일 대장pk는 buildings_by_pk 단계에서 이미 하나로 합쳐져 있다.
     기존 단독다가구_총괄있는_표제부.xlsx(총괄표제 O-case 지번주소 전용, 지번주소 컬럼 포함)를 대체한다.
     두 매칭 경로 모두 지번주소를 계산해 buildings_by_pk에 함께 담아두므로, 대장pk 옆에 지번주소
-    컬럼도 포함해 저장한다."""
+    컬럼도 포함해 저장한다.
+    대장출처(표제부/폐쇄말소)와 폐쇄말소일(폐쇄말소 표제부에서 찾은 건물만)도 함께 저장한다."""
 def _write_building_info(buildings_by_pk: dict):
-    result_columns = ["대장pk", "지번주소"] + [col for col in OUTPUT_EXTRA_COLUMNS if col != "대장pk"]
+    result_columns = ["대장pk", "대장출처", "지번주소", "폐쇄말소일"] + [col for col in OUTPUT_EXTRA_COLUMNS if col != "대장pk"]
     result = pd.DataFrame(buildings_by_pk.values(), columns=result_columns)
 
     building_count = len(result)
@@ -406,24 +445,26 @@ def _write_building_info(buildings_by_pk: dict):
 """
 def _write_summary(summary_rows: list):
     summary = pd.DataFrame(
-        summary_rows, columns=["파일명", "전체 개수", "확정번지 있는 개수", "표제부에 건물정보 있는 개수", "성공률"]
+        summary_rows,
+        columns=["파일명", "전체 개수", "확정번지 있는 개수", "표제부에 건물정보 있는 개수", "폐쇄말소 매칭 개수", "성공률"],
     )
 
     total_count = summary["전체 개수"].sum()
     total_beonji = summary["확정번지 있는 개수"].sum()
     total_building = summary["표제부에 건물정보 있는 개수"].sum()
+    total_closed = summary["폐쇄말소 매칭 개수"].sum()
     mean_rate = summary["성공률"].mean() if not summary.empty else 0
-    summary.loc[len(summary)] = ["합계", total_count, total_beonji, total_building, None]
-    summary.loc[len(summary)] = ["성공률 평균", None, None, None, mean_rate]
+    summary.loc[len(summary)] = ["합계", total_count, total_beonji, total_building, total_closed, None]
+    summary.loc[len(summary)] = ["성공률 평균", None, None, None, None, mean_rate]
 
     output_path = os.path.join(OUTPUT_DIR, SUMMARY_FILE_NAME)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         summary.to_excel(writer, sheet_name=SUMMARY_SHEET_NAME, index=False)
         sheet = writer.sheets[SUMMARY_SHEET_NAME]
-        # 성공률 컬럼(E열)을 퍼센트 형식으로 표시한다. 1행은 헤더.
+        # 성공률 컬럼(F열)을 퍼센트 형식으로 표시한다. 1행은 헤더.
         for row in range(2, len(summary) + 2):
-            sheet.cell(row=row, column=5).number_format = "0.0%"
+            sheet.cell(row=row, column=6).number_format = "0.0%"
 
     print(f"요약 통계 완료: {output_path} (성공률 평균: {mean_rate:.1%})")
 
@@ -433,20 +474,23 @@ def main():
     if not xlsx_paths:
         raise FileNotFoundError(f"{INPUT_DIR} 에 xlsx 파일이 없습니다.")
 
-    candidates_by_dong = _load_basis_candidates(BASIS_CSV)
+    candidates_by_dong = _load_basis_candidates(BASIS_CSV, BASIS_CSV_COLUMN_RENAME)
+    closed_candidates_by_dong = _load_basis_candidates(CLOSED_BASIS_CSV, CLOSED_BASIS_CSV_COLUMN_RENAME)
 
     print("매칭 중...")
     address_pk_cache = {}  # 지번주소 -> 대장pk 문자열(또는 None) 캐시, 파일 간 재사용
-    buildings_by_pk = {}  # 대장pk -> 건물 상세 딕셔너리, 전체 실행 동안 누적 -> 건물정보.xlsx
+    buildings_by_pk = {}  # (대장출처, 대장pk) -> 건물 상세 딕셔너리, 전체 실행 동안 누적 -> 건물정보.xlsx
     summary_rows = []
     for xlsx_path in xlsx_paths:
         print(f"{os.path.basename(xlsx_path)} 로딩 중...")
         deals, total_count = _load_deals(xlsx_path)
-        success_count, pk_filled_count = _match_and_write(
-            xlsx_path, deals, total_count, candidates_by_dong, address_pk_cache, buildings_by_pk
+        success_count, pk_filled_count, closed_count = _match_and_write(
+            xlsx_path, deals, total_count, candidates_by_dong, closed_candidates_by_dong, address_pk_cache, buildings_by_pk
         )
         building_rate = pk_filled_count / total_count if total_count else 0
-        summary_rows.append([os.path.basename(xlsx_path), total_count, success_count, pk_filled_count, building_rate])
+        summary_rows.append(
+            [os.path.basename(xlsx_path), total_count, success_count, pk_filled_count, closed_count, building_rate]
+        )
 
     _write_building_info(buildings_by_pk)
     _write_summary(summary_rows)
