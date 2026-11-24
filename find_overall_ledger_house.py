@@ -10,10 +10,10 @@ import pandas as pd
 if sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-INPUT_DIR = "data/raw"  # 이 디렉터리의 모든 xlsx를 전국 대상으로 한번에 처리한다.
-BASIS_CSV = "data/basis/건축물대장_총괄표제부.csv"
+INPUT_DIR = r"D:\dev\data\raw\traded_house_raw" # 이 디렉터리의 모든 xlsx를 전국 대상으로 한번에 처리한다.
+BASIS_CSV = r"D:\dev\data\basis\building_ledger\총괄표제부_2026_09.csv"
 BASIS_CSV_ENCODING = "utf-8-sig"
-OUTPUT_DIR = "data/processed"
+OUTPUT_DIR = r"D:\dev\data\processed\traded_house_processed\overall"
 SUMMARY_FILE_NAME = "총괄매핑_요약통계.xlsx"  # 파일별 매칭 통계를 모아 OUTPUT_DIR에 저장한다.
 SUMMARY_SHEET_NAME = "요약통계"
 
@@ -90,7 +90,7 @@ def _load_deals(xlsx_path: str):
     return deals, total_count
 
 
-"""총괄표제부 CSV를 청크 단위로 읽어, '일반'+'신대장'만 남기고 시군구("시도 구 법정동") 별로 묶은 후보 딕셔너리를 만든다.
+"""총괄표제부 CSV를 청크 단위로 읽어, '일반'만 남기고(신/구대장 구분은 거르지 않음) 시군구("시도 구 법정동") 별로 묶은 후보 딕셔너리를 만든다.
 
     전국 xlsx를 모두 처리하므로 동 단위 필터링 없이 전체를 대상으로 한다.
 """
@@ -102,9 +102,7 @@ def _load_basis_candidates(basis_csv_path: str) -> dict:
     chunks = []
     reader = pd.read_csv(basis_csv_path, encoding=BASIS_CSV_ENCODING, dtype=str, chunksize=CSV_CHUNK_SIZE)
     for chunk in reader:
-        chunk = chunk[
-            (chunk["대장_구분_코드_명"] == "일반") & (chunk["신_구_대장_구분_코드_명"] == "신대장")
-        ]
+        chunk = chunk[chunk["대장_구분_코드_명"] == "일반"]
         if chunk.empty:
             continue
 
@@ -155,13 +153,19 @@ def _match_deal(deal: dict, candidates_by_dong: dict):
     hits = candidates[mask]
 
     # 서브 매핑키: 건축년도 -> 주택유형(주용도) -> 대지면적 순으로, 후보가 2개 이상일 때만 한 단계씩 더 좁힌다.
-    if len(hits) >= 2:
-        hits = hits[hits["_사용승인연도"] == deal["건축년도"]]
-        if len(hits) >= 2:
-            allowed_juyongdo = HOUSE_TYPE_TO_JUYONGDO.get(deal["주택유형"], set())
-            hits = hits[hits["주_용도_코드_명"].isin(allowed_juyongdo)]
-            if len(hits) >= 2:
-                hits = hits[hits["대지_면적(㎡)"] == deal["대지면적(㎡)"]]
+    # 어떤 서브 매핑키를 적용한 결과가 0개면 그 키는 건너뛰고, 직전 후보를 유지한 채 다음 키로 넘어간다.
+    allowed_juyongdo = HOUSE_TYPE_TO_JUYONGDO.get(deal["주택유형"], set())
+    sub_key_filters = [
+        lambda df: df["_사용승인연도"] == deal["건축년도"],
+        lambda df: df["주_용도_코드_명"].isin(allowed_juyongdo),
+        lambda df: df["대지_면적(㎡)"] == deal["대지면적(㎡)"],
+    ]
+    for sub_key_filter in sub_key_filters:
+        if len(hits) < 2:
+            break
+        narrowed = hits[sub_key_filter(hits)]
+        if not narrowed.empty:
+            hits = narrowed
 
     if len(hits) != 1:
         return None
