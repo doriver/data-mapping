@@ -47,9 +47,18 @@ def parse_beonji(raw: str):
     return prefix, len(body)
 
 
-"""시군구 문자열의 연속 공백을 1개로 줄인다. 두 데이터 출처의 공백 표기가 달라도 같은 키로 매칭되게 한다."""
-def normalize_sigungu(raw: str) -> str:
-    return re.sub(r"\s+", " ", raw.strip())
+"""시군구 문자열의 연속 공백을 1개로 줄인다. 두 데이터 출처의 공백 표기가 달라도 같은 키로 매칭되게 한다.
+
+    법정동명을 비교용으로 정규화한다. (실거래 시군구, 총괄표제부 대지_위치에서 뗀 시군구에 공통 적용)
+    - 앞뒤 공백 제거
+    - 텍스트 사이 연속 공백(2칸 이상, 탭/전각 공백 포함)을 한 칸으로
+    문자열이 아니면(NaN 등) 그대로 반환한다.
+    예: "  경기도 화성시   새솔동 " -> "경기도 화성시 새솔동"
+"""
+def _normalize_dong_name(name):
+    if not isinstance(name, str):
+        return name
+    return re.sub(r"\s+", " ", name.strip())
 
 
 """건축물대장의 '대지_위치' 문자열에서 번지 부분을 떼어내, 시군구 문자열을 반환한다.
@@ -62,7 +71,7 @@ def parse_daeji_wichi(raw):
     match = _DAEJI_WICHI_RE.match(raw.strip())
     if not match:
         return None
-    return normalize_sigungu(match.group("dong"))
+    return _normalize_dong_name(match.group("dong"))
 
 
 """실거래가 xlsx를 읽어 해제(취소) 거래를 제외한 뒤, 매칭에 쓸 파생 컬럼(시군구, 번지 접두어/자리수)을 추가해 반환한다."""
@@ -85,7 +94,7 @@ def _load_deals(xlsx_path: str):
     total_count = len(deals)
 
     # 시군구 컬럼을 매칭키로 쓴다. 연속 공백을 1개로 줄여 총괄표제부 쪽 키 표기와 맞춘다.
-    deals["_시군구"] = deals["시군구"].map(normalize_sigungu)
+    deals["_시군구"] = deals["시군구"].map(_normalize_dong_name)
 
     parsed = deals["번지"].map(parse_beonji)
     deals["_번지_접두어"] = [p[0] for p in parsed]
