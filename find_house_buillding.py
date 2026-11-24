@@ -203,11 +203,18 @@ def _match_deal(deal: dict, candidates_by_dong: dict):
     hits = candidates[mask]
 
     # 서브 매핑키: 주택유형(주용도) -> 대지면적 순으로, 후보가 2개 이상일 때만 한 단계씩 더 좁힌다.
-    if len(hits) >= 2:
-        allowed_juyongdo = HOUSE_TYPE_TO_JUYONGDO.get(deal["주택유형"], set())
-        hits = hits[hits["주용도"].isin(allowed_juyongdo)]
-        if len(hits) >= 2:
-            hits = hits[hits["대지면적(㎡)"] == deal["대지면적(㎡)"]]
+    # 어떤 서브 매핑키를 적용한 결과가 0개면 그 키는 건너뛰고, 직전 후보를 유지한 채 다음 키로 넘어간다.
+    allowed_juyongdo = HOUSE_TYPE_TO_JUYONGDO.get(deal["주택유형"], set())
+    sub_key_filters = [
+        lambda df: df["주용도"].isin(allowed_juyongdo),
+        lambda df: df["대지면적(㎡)"] == deal["대지면적(㎡)"],
+    ]
+    for sub_key_filter in sub_key_filters:
+        if len(hits) < 2:
+            break
+        narrowed = hits[sub_key_filter(hits)]
+        if not narrowed.empty:
+            hits = narrowed
 
     if len(hits) != 1:
         return None
