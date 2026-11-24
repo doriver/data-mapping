@@ -4,11 +4,15 @@ import glob
 import os
 import re
 import sys
+import warnings
 
 import pandas as pd
 
 if sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
+
+# 실거래가 xlsx에 기본 셀 서식 정보가 없어 openpyxl이 띄우는 경고. 데이터 읽기에는 영향이 없으므로 숨긴다.
+warnings.filterwarnings("ignore", message="Workbook contains no default style")
 
 INPUT_DIR = r"D:\dev\data\raw\traded_house_raw" # 이 디렉터리의 모든 xlsx를 전국 대상으로 한번에 처리한다.
 BASIS_CSV = r"D:\dev\data\basis\building_ledger\총괄표제부_2026_09.csv"
@@ -63,7 +67,7 @@ def parse_daeji_wichi(raw):
 
 """실거래가 xlsx를 읽어 해제(취소) 거래를 제외한 뒤, 매칭에 쓸 파생 컬럼(시군구, 번지 접두어/자리수)을 추가해 반환한다."""
 def _load_deals(xlsx_path: str):
-    deals = pd.read_excel(xlsx_path, header=HEADER_ROW)
+    deals = pd.read_excel(xlsx_path, header=HEADER_ROW, engine="openpyxl")
 
     # 해제(취소) 신고가 등록되면, 취소되기 전 원본 행(해제사유발생일 "-")이 지워지지 않고, 취소 행(해제사유발생일에 날짜)과 별개로 하나 더 남아 중복되는 경우가 있다.
     # 이런 원본 중복 행은 잘못된 데이터이므로 집계 전에 제거한다.

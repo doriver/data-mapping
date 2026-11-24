@@ -6,18 +6,22 @@ import glob
 import os
 import re
 import sys
+import warnings
 
 import pandas as pd
 
 if sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-INPUT_DIR = "data/raw"  # 이 디렉터리의 모든 xlsx를 전국 대상으로 한번에 처리한다.
+# 실거래가 xlsx에 기본 셀 서식 정보가 없어 openpyxl이 띄우는 경고. 데이터 읽기에는 영향이 없으므로 숨긴다.
+warnings.filterwarnings("ignore", message="Workbook contains no default style")
+
+INPUT_DIR = r"D:\dev\data\processed\traded_house_processed\overall"  # 이 디렉터리의 모든 xlsx를 전국 대상으로 한번에 처리한다.
 # 전국 건축물대장 CSV(대장구분 미필터링, 809만행 규모).
 # 청크 단위로 읽으며 '일반' 대장구분 + 필요한 동만 추려낸다.
-BASIS_CSV = "data/basis/전국_건축물대장_csv_20260915104746.csv"
-BASIS_CSV_ENCODING = "utf-8"
-OUTPUT_DIR = "data/processed"
+BASIS_CSV = r"D:\dev\data\basis\building_ledger\표제부_2026_09.csv"
+BASIS_CSV_ENCODING = "utf-8-sig"  # CSV가 BOM 포함 UTF-8이라, BOM이 첫 컬럼명에 붙지 않도록 utf-8-sig로 읽는다.
+OUTPUT_DIR = r"D:\dev\data\processed\traded_house_processed"
 SUMMARY_FILE_NAME = "표제부매핑_단독다가구_요약통계.xlsx"  # 파일별 매칭 통계를 모아 OUTPUT_DIR에 저장한다.
 SUMMARY_SHEET_NAME = "요약통계"
 
@@ -55,12 +59,37 @@ BASIS_NUMERIC_EXTRA_COLUMNS = [
     "대지면적(㎡)", "건축면적(㎡)", "연면적(㎡)", "건폐율(%)", "용적률(%)", "용적률산정연면적(㎡)",
     "지상층수", "지하층수",
 ]
-# 매칭(대장구분/시도/시군구/법정동/번/지/사용승인일)에 필요한 컬럼 + 붙임 컬럼만 읽어 CSV 파싱 비용을 줄인다.
+# 건축물대장 CSV의 실제 헤더명 -> 이 스크립트 내부에서 쓰는 컬럼명. CSV 헤더 네이밍이 바뀌어도 내부 로직과
+# 결과 컬럼명은 그대로 두고, 읽은 직후 이 매핑으로 이름을 바꿔 맞춘다.
+BASIS_CSV_COLUMN_RENAME = {
+    "관리_건축물대장_PK": "PK",
+    "대장_구분_코드_명": "대장구분",
+    "대지_위치": "대지위치",
+    "번": "번",
+    "지": "지",
+    "대지_구분_코드": "대지구분",
+    "사용승인_일": "사용승인일",
+    "건물_명": "건물명",
+    "동_명": "동명",
+    "대지_면적(㎡)": "대지면적(㎡)",
+    "건축_면적(㎡)": "건축면적(㎡)",
+    "연면적(㎡)": "연면적(㎡)",
+    "건폐_율(%)": "건폐율(%)",
+    "용적_률(%)": "용적률(%)",
+    "용적_률_산정_연면적(㎡)": "용적률산정연면적(㎡)",
+    "구조_코드_명": "주구조",
+    "주_용도_코드_명": "주용도",
+    "지붕_코드_명": "주지붕",
+    "지상_층_수": "지상층수",
+    "지하_층_수": "지하층수",
+}
+# 매칭(대장구분/대지위치/번/지/사용승인일)에 필요한 컬럼 + 붙임 컬럼만 읽어 CSV 파싱 비용을 줄인다.
 # 대지구분은 '총괄표제 존재여부'가 O인 지번주소의 표제부 상세 조회에서 산 지번을 구분하는 데 쓴다.
-BASIS_USECOLS = sorted(set(
-    ["대장구분", "시도", "시군구", "법정동", "번", "지", "대지구분", "사용승인일", "연면적(㎡)", "대지면적(㎡)", "주용도"]
-    + BASIS_EXTRA_COLUMNS
-))
+BASIS_USECOLS = list(BASIS_CSV_COLUMN_RENAME.keys())
+# 건축물대장 대지_구분_코드 중 산 지번을 뜻하는 값(0: 대지, 1: 산, 2: 블록).
+SAN_DAEJI_GUBUN_CODE = "1"
+# "서울특별시 성북구 돈암동 552-3번지" / "...산11-1번지" 형태의 대지위치 끝에서 번지 부분을 떼어내기 위한 패턴.
+_DAEJI_WICHI_BEONJI_RE = re.compile(r"\s+산?\d+(?:-\d+)?번지$")
 
 
 """마스킹된 번지 문자열을 (자리수 접두어, 자리수)로 분리한다.
@@ -82,7 +111,7 @@ def normalize_sigungu(raw: str) -> str:
 def _load_deals(xlsx_path: str):
     # 확정번지/번지는 셀에 문자열로 저장돼 있어도, 값이 전부 숫자 형태(예: "1556", '-' 없음)면 pandas가 float로 추론해
     # "1556.0"이 되므로 문자열로 고정해서 읽는다.
-    deals = pd.read_excel(xlsx_path, header=HEADER_ROW, dtype={"확정번지": str, "번지": str})
+    deals = pd.read_excel(xlsx_path, header=HEADER_ROW, dtype={"확정번지": str, "번지": str}, engine="openpyxl")
     # 확정번지가 전부 비어있으면(NaN) float64로 읽혀, 이후 문자열 대입 시 타입 충돌이 나므로 object로 맞춰둔다.
     deals["확정번지"] = deals["확정번지"].astype(object)
 
@@ -100,7 +129,17 @@ def _load_deals(xlsx_path: str):
     return deals, total_count
 
 
-"""전국 건축물대장 CSV를 청크 단위로 읽어, '일반' 대장구분만 남기고 시군구(시도+시군구+법정동 결합 문자열) 별로 묶은 후보 딕셔너리를 만든다.
+"""건축물대장의 '대지위치' 문자열에서 끝의 번지 부분을 떼어내, 시군구("시도 구 법정동") 문자열을 반환한다.
+
+    번지로 끝나지 않는 값(예: 번지 없이 동까지만 있는 값)은 그대로 공백만 정리해 반환하고, 문자열이 아니면 None을 반환한다.
+"""
+def parse_daeji_wichi(raw):
+    if not isinstance(raw, str):
+        return None
+    return normalize_sigungu(_DAEJI_WICHI_BEONJI_RE.sub("", raw.strip()))
+
+
+"""전국 건축물대장 CSV를 청크 단위로 읽어, '일반' 대장구분만 남기고 시군구(대지위치에서 번지를 뗀 "시도 구 법정동" 문자열) 별로 묶은 후보 딕셔너리를 만든다.
 
     전국 xlsx를 모두 처리하므로 동 단위 필터링 없이 전체를 대상으로 한다.
 """
@@ -114,14 +153,15 @@ def _load_basis_candidates(basis_csv_path: str) -> dict:
         basis_csv_path, encoding=BASIS_CSV_ENCODING, dtype=str, usecols=BASIS_USECOLS, chunksize=CSV_CHUNK_SIZE
     )
     for chunk in reader:
+        chunk = chunk.rename(columns=BASIS_CSV_COLUMN_RENAME)
         chunk = chunk[chunk["대장구분"] == "일반"]
         if chunk.empty:
             continue
 
         chunk = chunk.copy()
-        # 시도/시군구/법정동 중 비어있는 값은 빈 문자열로 취급해 그대로 결합한다.
-        dong_parts = chunk["시도"].fillna("") + " " + chunk["시군구"].fillna("") + " " + chunk["법정동"].fillna("")
-        chunk["_시군구"] = dong_parts.map(normalize_sigungu)
+        # CSV에 시도/시군구/법정동 컬럼이 따로 없으므로, 대지위치에서 번지를 떼어낸 문자열을 시군구 키로 쓴다.
+        chunk["_시군구"] = chunk["대지위치"].map(parse_daeji_wichi)
+        chunk = chunk[chunk["_시군구"].notna()]
         chunk["_번_정수"] = pd.to_numeric(chunk["번"], errors="coerce")
         chunk["_지_정수"] = pd.to_numeric(chunk["지"], errors="coerce").fillna(0)
         chunk = chunk[chunk["_번_정수"].notna()].copy()
@@ -295,7 +335,7 @@ def _fill_o_case_pk(deals, candidates_by_dong: dict, address_pk_cache: dict, bui
 
 """지번주소 하나(딕셔너리 형태의 행)에 대해 매핑되는 표제부 row(들)를 찾는다.
 
-    산 지번이면 대지구분 == '산' 조건을 추가로 건다. 매칭된 row마다 {OUTPUT_EXTRA_COLUMNS...(대장pk 포함)}
+    산 지번이면 대지구분 == SAN_DAEJI_GUBUN_CODE('1', 산) 조건을 추가로 건다. 매칭된 row마다 {OUTPUT_EXTRA_COLUMNS...(대장pk 포함)}
     딕셔너리를 만들어 리스트로 반환하고, 하나도 못 찾으면 값이 모두 비어있는 딕셔너리 1개짜리 리스트를 반환한다.
 """
 def _match_address_basis_rows(address: dict, candidates_by_dong: dict) -> list:
@@ -303,7 +343,7 @@ def _match_address_basis_rows(address: dict, candidates_by_dong: dict) -> list:
     if candidates is not None:
         mask = (candidates["_번_정수"] == address["_확정번"]) & (candidates["_지_정수"] == address["_확정지"])
         if address["_산여부"]:
-            mask &= candidates["대지구분"] == "산"
+            mask &= candidates["대지구분"] == SAN_DAEJI_GUBUN_CODE
         hits = candidates[mask]
     else:
         hits = None
