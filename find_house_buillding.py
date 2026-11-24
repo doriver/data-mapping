@@ -29,6 +29,13 @@ CLOSED_BASIS_CSV = r"D:\dev\data\basis\building_ledger\closed\폐쇄말소_표�
 SOURCE_OVERALL = "총괄표제부"  # find_overall_ledger_house.py 단계에서 이미 확정번지를 찾은 행
 SOURCE_CURRENT = "표제부"
 SOURCE_CLOSED = "폐쇄말소"
+# 허용오차 매칭: 정확 매칭(표제부 -> 폐쇄말소)으로 못 찾은 행만, 건축년도/연면적 차이를 아래 범위까지 허용해 한 번 더 매칭한다.
+# (실거래 신고 건축년도가 사용승인연도와 1년 어긋나거나, 연면적이 소수점/반올림 차이로 조금 다른 경우를 잡기 위함)
+# 정확 매칭보다 오매칭 위험이 있으므로 매칭출처에 "(허용오차)"를 붙여 구분한다.
+YEAR_TOLERANCE = 1  # 건축년도 ±1년
+AREA_TOLERANCE = 1.0  # 연면적 ±1㎡
+FLOAT_EPSILON = 1e-9  # 51.04 - 50.04 = 1.0000000000000002 같은 부동소수점 오차로 경계값이 빠지지 않도록 더하는 값
+TOLERANCE_SUFFIX = "(허용오차)"
 OUTPUT_DIR = r"D:\dev\data\processed\traded_house_processed"
 SUMMARY_FILE_NAME = "표제부매핑_단독다가구_요약통계.xlsx"  # 파일별 매칭 통계를 모아 OUTPUT_DIR에 저장한다.
 SUMMARY_SHEET_NAME = "요약통계"
@@ -212,18 +219,26 @@ def _load_basis_candidates(basis_csv_path: str, column_rename: dict) -> dict:
     확정되면 {"확정번지": ..., "지번주소": ..., OUTPUT_EXTRA_COLUMNS...(대장pk 포함)} 딕셔너리를,
     실패하면 None을 반환한다. 지번주소는 산 여부를 원본 '번지'(마스킹된 값, 예: "산1**")로 판단해
     시군구+확정번지로 조합한 것으로, 건물정보.xlsx에 저장할 때 쓰인다.
+    year_tolerance/area_tolerance가 0이면 건축년도/연면적 정확 일치, 0보다 크면 그 차이까지 허용한다.
 """
-def _match_deal(deal: dict, candidates_by_dong: dict):
+def _match_deal(deal: dict, candidates_by_dong: dict, year_tolerance: int = 0, area_tolerance: float = 0):
     candidates = candidates_by_dong.get(deal["_시군구"])
     if candidates is None:
         return None
 
     # 고유 매핑키: 번지(자리수+접두어, 지는 제외) + 연면적 + 건축년도가 모두 정확히 일치해야 한다.
+    # (허용오차 매칭이면 연면적/건축년도는 허용 범위 안이면 일치로 본다.)
+    if year_tolerance or area_tolerance:
+        area_mask = (candidates["연면적(㎡)"] - deal["연면적(㎡)"]).abs() <= area_tolerance + FLOAT_EPSILON
+        year_mask = (candidates["_사용승인연도"] - deal["건축년도"]).abs() <= year_tolerance
+    else:
+        area_mask = candidates["연면적(㎡)"] == deal["연면적(㎡)"]
+        year_mask = candidates["_사용승인연도"] == deal["건축년도"]
     mask = (
         (candidates["_번_자리수"] == deal["_번지_자리수"])
         & candidates["_번_문자열"].str.startswith(deal["_번지_접두어"])
-        & (candidates["연면적(㎡)"] == deal["연면적(㎡)"])
-        & (candidates["_사용승인연도"] == deal["건축년도"])
+        & area_mask
+        & year_mask
     )
     hits = candidates[mask]
 
@@ -266,8 +281,10 @@ def _match_deal(deal: dict, candidates_by_dong: dict):
     현재 표제부(candidates_by_dong)로 매칭 실패한 행은 폐쇄말소 표제부(closed_candidates_by_dong)로 다시 매칭한다.
     어느 대장에서 찾았는지는 '매칭출처' 컬럼(총괄표제부/표제부/폐쇄말소)에 남긴다.
     buildings_by_pk의 키는 (대장출처, 대장pk)다. 현재 표제부와 폐쇄말소 표제부의 PK는 서로 다른 체계라 출처를 함께 키로 쓴다.
+    정확 매칭으로도 못 찾은 행은 건축년도 ±YEAR_TOLERANCE, 연면적 ±AREA_TOLERANCE를 허용해
+    표제부 -> 폐쇄말소 순으로 한 번 더 매칭하고, 매칭출처에 "(허용오차)"를 붙인다.
 
-    요약 통계 파일 작성을 위해 (확정번지 있는 건수, 대장pk가 채워진(표제부에 건물정보 있는) 건수, 폐쇄말소 매칭 건수)를 반환한다."""
+    요약 통계 파일 작성을 위해 (확정번지 있는 건수, 대장pk가 채워진(표제부에 건물정보 있는) 건수, 폐쇄말소 매칭 건수, 허용오차 매칭 건수)를 반환한다."""
 def _match_and_write(
     xlsx_path: str, deals, total_count: int, candidates_by_dong: dict, closed_candidates_by_dong: dict,
     address_pk_cache: dict, buildings_by_pk: dict
@@ -275,32 +292,44 @@ def _match_and_write(
     needs_match_mask = deals["확정번지"].isna()
     needs_match_index = deals.index[needs_match_mask]
     needs_match_records = deals.loc[needs_match_mask].to_dict("records")
-    match_results = [_match_deal(deal, candidates_by_dong) for deal in needs_match_records]
-    # 현재 표제부로 못 찾은 행만 폐쇄말소 표제부로 보완 매칭한다. (이미 찾은 행은 건드리지 않는다.)
-    closed_results = [
-        _match_deal(deal, closed_candidates_by_dong) if result is None else None
-        for deal, result in zip(needs_match_records, match_results)
-    ]
 
-    # (행 index, 매칭 결과, 매칭출처) 목록
-    found = [(idx, result, SOURCE_CURRENT) for idx, result in zip(needs_match_index, match_results) if result is not None]
-    found += [(idx, result, SOURCE_CLOSED) for idx, result in zip(needs_match_index, closed_results) if result is not None]
-    found_index = [idx for idx, _, _ in found]
+    # 매칭 단계: (후보, 대장출처, 건축년도 허용오차, 연면적 허용오차, 매칭출처). 앞 단계에서 못 찾은 행만 다음 단계로 넘어간다.
+    # 정확 매칭(표제부 -> 폐쇄말소)을 모두 시도한 뒤에야 허용오차 매칭을 하므로, 정확히 맞는 건물이 있으면 항상 그쪽이 우선이다.
+    match_stages = [
+        (candidates_by_dong, SOURCE_CURRENT, 0, 0, SOURCE_CURRENT),
+        (closed_candidates_by_dong, SOURCE_CLOSED, 0, 0, SOURCE_CLOSED),
+        (candidates_by_dong, SOURCE_CURRENT, YEAR_TOLERANCE, AREA_TOLERANCE, SOURCE_CURRENT + TOLERANCE_SUFFIX),
+        (closed_candidates_by_dong, SOURCE_CLOSED, YEAR_TOLERANCE, AREA_TOLERANCE, SOURCE_CLOSED + TOLERANCE_SUFFIX),
+    ]
+    # 행별 (매칭 결과, 대장출처, 매칭출처). 아직 못 찾은 행은 None.
+    stage_results = [None] * len(needs_match_records)
+    for stage_candidates, ledger, year_tolerance, area_tolerance, source in match_stages:
+        for i, deal in enumerate(needs_match_records):
+            if stage_results[i] is not None:
+                continue
+            result = _match_deal(deal, stage_candidates, year_tolerance, area_tolerance)
+            if result is not None:
+                stage_results[i] = (result, ledger, source)
+
+    # (행 index, 매칭 결과, 대장출처, 매칭출처) 목록
+    found = [(idx, *stage_result) for idx, stage_result in zip(needs_match_index, stage_results) if stage_result is not None]
+    found_index = [idx for idx, _, _, _ in found]
 
     if "대장pk" not in deals.columns:
         deals["대장pk"] = pd.NA
     # 총괄표제부 단계에서 이미 확정번지를 찾은 행은 출처를 총괄표제부로 둔다.
     deals["매칭출처"] = deals["총괄표제 존재여부"].map({"O": SOURCE_OVERALL})
     if found_index:
-        deals.loc[found_index, "확정번지"] = [result["확정번지"] for _, result, _ in found]
-        deals.loc[found_index, "대장pk"] = [result["대장pk"] for _, result, _ in found]
-        deals.loc[found_index, "매칭출처"] = [source for _, _, source in found]
+        deals.loc[found_index, "확정번지"] = [result["확정번지"] for _, result, _, _ in found]
+        deals.loc[found_index, "대장pk"] = [result["대장pk"] for _, result, _, _ in found]
+        deals.loc[found_index, "매칭출처"] = [source for _, _, _, source in found]
 
     # 마스킹 번지 경로(_match_deal)에서 매칭된 건물 상세를 (대장출처, 대장pk) 기준으로 누적(건물정보.xlsx용).
-    for _, result, source in found:
-        buildings_by_pk[(source, result["대장pk"])] = {
+    # 대장출처는 허용오차 여부와 상관없이 실제 대장(표제부/폐쇄말소)이다.
+    for _, result, ledger, _ in found:
+        buildings_by_pk[(ledger, result["대장pk"])] = {
             "지번주소": result["지번주소"],
-            "대장출처": source,
+            "대장출처": ledger,
             "폐쇄말소일": result["폐쇄말소일"],
             **{col: result[col] for col in OUTPUT_EXTRA_COLUMNS},
         }
@@ -309,14 +338,19 @@ def _match_and_write(
 
     deals = deals.drop(columns=["_시군구", "_번지_접두어", "_번지_자리수"])
 
-    current_success_count = sum(1 for _, _, source in found if source == SOURCE_CURRENT)
-    closed_success_count = sum(1 for _, _, source in found if source == SOURCE_CLOSED)
+    # 매칭출처별 건수(표제부, 폐쇄말소, 표제부(허용오차), 폐쇄말소(허용오차))
+    source_counts = {source: 0 for *_, source in match_stages}
+    for _, _, _, source in found:
+        source_counts[source] += 1
+    closed_success_count = sum(1 for _, _, ledger, _ in found if ledger == SOURCE_CLOSED)
+    tolerance_success_count = sum(1 for _, _, _, source in found if source.endswith(TOLERANCE_SUFFIX))
     new_success_count = len(found_index)
     success_count = deals["확정번지"].notna().sum()
     success_rate = success_count / total_count if total_count else 0
     pk_filled_count = deals["대장pk"].notna().sum()
+    source_breakdown = " + ".join(f"{source} {count}" for source, count in source_counts.items())
     print(f"{os.path.basename(xlsx_path)} 전체 건수: {total_count}")
-    print(f"{os.path.basename(xlsx_path)} 신규 매칭 성공 건수(총괄표제 미존재 대상): {new_success_count} / {needs_match_mask.sum()} (표제부 {current_success_count} + 폐쇄말소 {closed_success_count})")
+    print(f"{os.path.basename(xlsx_path)} 신규 매칭 성공 건수(총괄표제 미존재 대상): {new_success_count} / {needs_match_mask.sum()} ({source_breakdown})")
     print(f"{os.path.basename(xlsx_path)} 매칭 성공 건수(확정번지): {success_count}")
     print(f"{os.path.basename(xlsx_path)} 매칭 성공률: {success_rate:.1%}")
     print(f"{os.path.basename(xlsx_path)} 대장pk 채워진 건수: {pk_filled_count} (신규 매칭 {new_success_count} + 총괄표제 O-case {o_case_pk_count})")
@@ -333,9 +367,10 @@ def _match_and_write(
         sheet["L1"] = f"매칭 성공률: {success_rate:.1%}"
         sheet["Q1"] = f"대장pk 채워진 건수: {pk_filled_count}"
         sheet["V1"] = f"폐쇄말소 매칭 건수: {closed_success_count}"
+        sheet["AA1"] = f"허용오차 매칭 건수: {tolerance_success_count}"
 
     print(f"완료: {output_path}")
-    return int(success_count), int(pk_filled_count), closed_success_count
+    return int(success_count), int(pk_filled_count), closed_success_count, tolerance_success_count
 
 
 """'총괄표제 존재여부'가 'O'인 행(이미 총괄표제부로 확정번지를 찾은 행)에 대해 지번주소를 만들고,
@@ -446,25 +481,29 @@ def _write_building_info(buildings_by_pk: dict):
 def _write_summary(summary_rows: list):
     summary = pd.DataFrame(
         summary_rows,
-        columns=["파일명", "전체 개수", "확정번지 있는 개수", "표제부에 건물정보 있는 개수", "폐쇄말소 매칭 개수", "성공률"],
+        columns=[
+            "파일명", "전체 개수", "확정번지 있는 개수", "표제부에 건물정보 있는 개수", "폐쇄말소 매칭 개수",
+            "허용오차 매칭 개수", "성공률",
+        ],
     )
 
     total_count = summary["전체 개수"].sum()
     total_beonji = summary["확정번지 있는 개수"].sum()
     total_building = summary["표제부에 건물정보 있는 개수"].sum()
     total_closed = summary["폐쇄말소 매칭 개수"].sum()
+    total_tolerance = summary["허용오차 매칭 개수"].sum()
     mean_rate = summary["성공률"].mean() if not summary.empty else 0
-    summary.loc[len(summary)] = ["합계", total_count, total_beonji, total_building, total_closed, None]
-    summary.loc[len(summary)] = ["성공률 평균", None, None, None, None, mean_rate]
+    summary.loc[len(summary)] = ["합계", total_count, total_beonji, total_building, total_closed, total_tolerance, None]
+    summary.loc[len(summary)] = ["성공률 평균", None, None, None, None, None, mean_rate]
 
     output_path = os.path.join(OUTPUT_DIR, SUMMARY_FILE_NAME)
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         summary.to_excel(writer, sheet_name=SUMMARY_SHEET_NAME, index=False)
         sheet = writer.sheets[SUMMARY_SHEET_NAME]
-        # 성공률 컬럼(F열)을 퍼센트 형식으로 표시한다. 1행은 헤더.
+        # 성공률 컬럼(G열)을 퍼센트 형식으로 표시한다. 1행은 헤더.
         for row in range(2, len(summary) + 2):
-            sheet.cell(row=row, column=6).number_format = "0.0%"
+            sheet.cell(row=row, column=7).number_format = "0.0%"
 
     print(f"요약 통계 완료: {output_path} (성공률 평균: {mean_rate:.1%})")
 
@@ -484,12 +523,13 @@ def main():
     for xlsx_path in xlsx_paths:
         print(f"{os.path.basename(xlsx_path)} 로딩 중...")
         deals, total_count = _load_deals(xlsx_path)
-        success_count, pk_filled_count, closed_count = _match_and_write(
+        success_count, pk_filled_count, closed_count, tolerance_count = _match_and_write(
             xlsx_path, deals, total_count, candidates_by_dong, closed_candidates_by_dong, address_pk_cache, buildings_by_pk
         )
         building_rate = pk_filled_count / total_count if total_count else 0
         summary_rows.append(
-            [os.path.basename(xlsx_path), total_count, success_count, pk_filled_count, closed_count, building_rate]
+            [os.path.basename(xlsx_path), total_count, success_count, pk_filled_count, closed_count, tolerance_count,
+             building_rate]
         )
 
     _write_building_info(buildings_by_pk)
