@@ -203,14 +203,13 @@ def discover_region_files():
 def _load_deals(xlsx_path: str):
     # 확정번지는 셀에 문자열로 저장돼 있어도, 값이 전부 숫자 형태(예: "1556", '-' 없음)면 pandas가 float로 추론해
     # "1556.0"이 되므로 문자열로 고정해서 읽는다. (확정번지 컬럼이 없는 파일이어도 dtype 지정은 에러 없이 무시된다)
-    deals = pd.read_excel(xlsx_path, header=HEADER_ROW, dtype={"확정번지": str}, engine="calamine")
     # 원본 xlsx 1행의 통계 요약 셀이 표보다 오른쪽 열(V~AA 등)까지 쓰여 있어, 헤더가 빈 그 열들이
-    # "Unnamed: 21" 같은 빈 컬럼으로 함께 읽힌다. 헤더도 없고 값도 전부 비어 있는 컬럼만 제거한다.
-    empty_unnamed = [
-        col for col in deals.columns
-        if str(col).startswith("Unnamed:") and deals[col].isna().all()
-    ]
-    deals = deals.drop(columns=empty_unnamed)
+    # "Unnamed: 21" 같은 빈 컬럼으로 함께 읽힌다. usecols로 헤더 이름이 있는 열만 읽어 애초에 생기지 않게 한다.
+    # (헤더가 비어 있는 열은 값이 있어도 읽지 않는다.)
+    deals = pd.read_excel(
+        xlsx_path, header=HEADER_ROW, dtype={"확정번지": str}, engine="calamine",
+        usecols=lambda col: not str(col).startswith("Unnamed:"),
+    )
     if "확정번지" not in deals.columns:
         return None, 0
 
