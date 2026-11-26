@@ -118,12 +118,13 @@ def _dong_compare_key(name, strip_sido: bool):
     parts = name.split(" ", 1)
     return parts[1] if len(parts) == 2 else name
 
-"""법정동 변경 이력 csv를 읽어 {최신 법정동명: {과거 법정동명, ...}} 역방향 dict를 만든다.
+"""법정동 변경 이력 csv를 읽어 {최신 법정동명: 과거 법정동명} 역방향 dict를 만든다.
 
     이름은 "시도 시군구 읍면동 [리]"를 공백으로 이은 전체 이름이다(실거래 시군구, csv 법정동명과 같은 형식).
-    (예: "경기도 화성시 만세구 새솔동" -> {"경기도 화성시 새솔동"})
+    (예: "경기도 화성시 만세구 새솔동" -> "경기도 화성시 새솔동")
     읍면동이 없는 시도/시군구 단위 행은 실거래 시군구와 비교할 수 없으므로 제외한다.
-    합병처럼 새 이름 하나에 과거 이름이 여럿일 수 있으므로 값은 집합이다.
+    변경 이력은 법정동마다 1건(1단계)뿐이므로 값은 과거 법정동명 1개다.
+    혹시 같은 최신 법정동에 서로 다른 과거 이름이 2개 이상 있으면 경고를 출력하고 처음 것만 쓴다.
 """
 def _load_bjd_reverse_map() -> dict:
     paths = sorted(glob.glob(os.path.join(BJD_CHANGE_DIR, BJD_CHANGE_PATTERN)))
@@ -141,26 +142,19 @@ def _load_bjd_reverse_map() -> dict:
     reverse_map = {}
     for _, row in history.iterrows():
         prev_name, next_name = full_name(row, "prev"), full_name(row, "next")
-        if prev_name != next_name:
-            reverse_map.setdefault(next_name, set()).add(prev_name)
+        if prev_name == next_name:
+            continue
+        if next_name in reverse_map and reverse_map[next_name] != prev_name:
+            print(f"경고: '{next_name}'의 과거 법정동이 2개 이상 ({reverse_map[next_name]}, {prev_name}) - 처음 것만 사용")
+            continue
+        reverse_map[next_name] = prev_name
     print(f"법정동 변경 이력 로드: {os.path.basename(path)} (읍면동 단위 {len(reverse_map)}건)")
     return reverse_map
 
-"""변경 이력을 거꾸로 따라가(BFS) dong의 과거 법정동명들을 가까운 시점부터 순서대로 반환한다. (dong 자신은 제외)"""
-def _ancestors(dong: str, reverse_map: dict) -> list:
-    result = []
-    visited = {dong}
-    frontier = [dong]
-    while frontier:
-        next_frontier = []
-        for name in frontier:
-            for prev_name in sorted(reverse_map.get(name, ())):
-                if prev_name not in visited:
-                    visited.add(prev_name)
-                    result.append(prev_name)
-                    next_frontier.append(prev_name)
-        frontier = next_frontier
-    return result
+"""조회에 쓸 법정동명 목록을 반환한다: [dong 자신] + (변경 이력이 있으면) [과거 법정동명 1개]."""
+def _dong_with_prev(dong: str, reverse_map: dict) -> list:
+    prev_name = reverse_map.get(dong)
+    return [dong] if prev_name is None else [dong, prev_name]
 
 """RAW_DIR의 xlsx와 BASIS_DIRS(연도별)의 csv를 파일명 접두어(지역명) 기준으로 짝짓는다.
 
@@ -325,7 +319,7 @@ def _match_deals(deals, candidates_by_group: dict, present_dongs: set, reverse_m
             # csv 법정동명(present_dongs)도 정규화돼 있으므로 실거래 시군구도 정규화한 뒤 비교한다.
             dong = _normalize_dong_name(raw_dong)
             # 변경 이력은 시도까지 포함한 전체 이름으로 따라가고, present_dongs와는 비교 키로 비교한다.
-            for name in [dong] + _ancestors(dong, reverse_map):
+            for name in _dong_with_prev(dong, reverse_map):
                 key = _dong_compare_key(name, strip_sido)
                 if key in present_dongs:
                     lookup = key
@@ -593,7 +587,7 @@ def process_region_group(region: str, xlsx_paths, csv_list: list, reverse_map: d
                 # csv 법정동명과 같은 기준으로 비교하도록 정규화한 이름으로 키를 만든다.
                 # (변경 이력은 시도 포함 전체 이름으로 따라간 뒤, 각 이름을 비교 키로 바꿔 넣는다.)
                 dong = _normalize_dong_name(raw_dong)
-                for name in [dong] + _ancestors(dong, reverse_map):
+                for name in _dong_with_prev(dong, reverse_map):
                     needed_dongs.add(_dong_compare_key(name, strip_sido))
         if not needed_dongs:
             print(f"[{region}] 남은 미매칭 행이 없어 {year}년 이후 매칭은 생략")
