@@ -36,7 +36,7 @@ YEAR_TOLERANCE = 1  # 건축년도 ±1년
 AREA_TOLERANCE = 1.0  # 연면적 ±1㎡
 FLOAT_EPSILON = 1e-9  # 51.04 - 50.04 = 1.0000000000000002 같은 부동소수점 오차로 경계값이 빠지지 않도록 더하는 값
 TOLERANCE_SUFFIX = "(허용오차)"
-OUTPUT_DIR = r"D:\dev\data\processed\traded_house_processed"
+OUTPUT_DIR = r"D:\dev\data\processed\traded_house_processed\building"
 SUMMARY_FILE_NAME = "표제부매핑_단독다가구_요약통계.xlsx"  # 파일별 매칭 통계를 모아 OUTPUT_DIR에 저장한다.
 SUMMARY_SHEET_NAME = "요약통계"
 
