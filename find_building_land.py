@@ -31,7 +31,7 @@ OUTPUT_DIR = r"D:\dev\data\processed\traded_house_processed\land"
 
 HEADER_ROW = 2  # find_house_buillding.py/find_general_building.py가 저장한 xlsx의 실제 표 헤더 행(0-index)
 OUTPUT_SHEET_NAME = "실거래가"
-DATA_START_ROW = 2  # 0-index. 1행에 통계 요약, 2행은 빈 줄, 3행부터 표 작성
+DATA_START_ROW = 5  # 토지 실거래쪽이랑 맞춤0-index. 1행에 통계 요약, 2행은 빈 줄
 SUMMARY_FILE_NAME = "건물토지매핑_요약통계.xlsx"  # 파일별 매칭 통계를 모아 OUTPUT_DIR에 저장한다.
 SUMMARY_SHEET_NAME = "요약통계"
 
