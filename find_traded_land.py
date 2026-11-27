@@ -13,7 +13,7 @@ import pandas as pd
 if sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-RAW_DIR = r"D:\dev\data\raw" # \traded_land_raw
+RAW_DIR = r"D:\dev\data\raw\traded_land_raw" # 
 # (연도, 경로) 목록. 리스트 순서가 곧 매칭 우선순위다.
 # 1차로 첫 연도(26) 토지특성정보로 전체 실거래를 매칭하고, 이후 연도(25 -> 24 -> 23)는 앞 연도까지 매칭 안 된 행만 재매칭한다.
 # 지역마다 한 번에 1개 연도 csv만 메모리에 올리고, 그 연도 매칭이 끝나면 해제한 뒤 다음 연도로 넘어간다.

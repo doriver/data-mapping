@@ -13,8 +13,8 @@ import pandas as pd
 if sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-RAW_DIR = "data/raw"
-BASIS_DIR = "data/basis"
+RAW_DIR = r"D:\dev\data\processed\traded_house_processed\land"
+BASIS_DIR = r"D:\dev\data\basis\cadastral_map"
 # find_land_nationwide.py 와 동일한 지역 판별 목록.
 REGION_NAMES = [
     "서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종",
@@ -23,7 +23,7 @@ REGION_NAMES = [
 SHP_ENCODING = "cp949"
 SHP_PNU_FIELD = "A1"  # 지적도 SHP 필드명. 서울/경기 SHP 기준으로 확인됨(다른 지역은 다를 수 있음)
 HEADER_ROW = 2  # 5 , 2  , find_land(_nationwide)가 만든 "_매핑" xlsx의 실제 표 헤더 행(0-index)
-OUTPUT_DIR = "data/processed"
+OUTPUT_DIR = r"D:\dev\data\processed\traded_whole\coordinate"
 DATA_START_ROW = 5  # 0-index. 상단 요약 행 + 빈 줄을 남기고 그 아래부터 표 작성
 
 
