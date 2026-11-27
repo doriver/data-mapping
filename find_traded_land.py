@@ -13,7 +13,7 @@ import pandas as pd
 if sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-RAW_DIR = r"D:\dev\data\raw\traded_land_raw"
+RAW_DIR = r"D:\dev\data\raw" # \traded_land_raw
 # (연도, 경로) 목록. 리스트 순서가 곧 매칭 우선순위다.
 # 1차로 첫 연도(26) 토지특성정보로 전체 실거래를 매칭하고, 이후 연도(25 -> 24 -> 23)는 앞 연도까지 매칭 안 된 행만 재매칭한다.
 # 지역마다 한 번에 1개 연도 csv만 메모리에 올리고, 그 연도 매칭이 끝나면 해제한 뒤 다음 연도로 넘어간다.
@@ -415,7 +415,8 @@ def _match_deals(deals, candidates_by_group: dict, present_dongs: set, reverse_m
         # 6. [서브조건] 중요조건을 만족하는 후보가 1건이면 바로 매칭 확정.
         #    2건 이상이면(중요조건만으로 특정 불가) 아래 서브조건을 순서대로 하나씩 적용해 다시 좁힌다.
         #    (1) 도로조건 일치 -> (2) 용도지역, 지목 모두 일치
-        #    각 단계에서 1건이 되면 확정, 0건이면 실패, 2건 이상이면 다음 서브조건으로 넘어간다.
+        #    각 단계에서 1건이 되면 확정, 2건 이상이면 다음 서브조건으로 넘어간다.
+        #    서브조건 적용 결과가 0건이면 그 서브조건은 건너뛰고(직전 후보 유지) 다음 서브조건으로 넘어간다.
         #    (모든 서브조건을 거친 뒤에도 2건 이상이면 특정할 수 없으므로 매칭하지 않는다.)
         sub_filters = [
             lambda idx: candidates["도로조건"][idx] == row.도로조건,
@@ -424,7 +425,10 @@ def _match_deals(deals, candidates_by_group: dict, present_dongs: set, reverse_m
         for sub_filter in sub_filters:
             if len(hits) < 2: # 서브조건을 적용하기 전에 먼저 건수를 확인
                 break
-            hits = hits[sub_filter(hits)]
+            filtered = hits[sub_filter(hits)]
+            # 0건이면 이 서브조건으로는 좁힐 수 없으므로 적용하지 않고 직전 후보를 유지한다.
+            if len(filtered):
+                hits = filtered
 
         # 7. 최종 후보가 정확히 1건일 때만 매칭 확정(PNU/실제 번지 확정)한다.
         if len(hits) == 1:
